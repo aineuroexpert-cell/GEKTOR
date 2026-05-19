@@ -211,8 +211,8 @@ class ReliableIngestionBuffer:
                         if isinstance(value, str) and len(value) >= 19:
                             try:
                                 params[key] = datetime.fromisoformat(value.replace(" ", "T"))
-                            except Exception:
-                                pass
+                            except (ValueError, TypeError) as e:
+                                logger.debug(f"[DB] Datetime parse skipped for key={key}: {e}")
 
                 async with self.db.SessionLocal() as session:
                     try:
@@ -283,8 +283,8 @@ class ReliableIngestionBuffer:
                     if isinstance(value, str) and len(value) >= 19:
                         try:
                             params[key] = datetime.fromisoformat(value.replace(" ", "T"))
-                        except Exception:
-                            pass
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f"[DB] Datetime parse skipped for key={key}: {e}")
 
             async with self.db.SessionLocal() as session:
                 await session.execute(text(data["query"]), params)

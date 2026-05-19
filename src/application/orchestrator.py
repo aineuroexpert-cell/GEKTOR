@@ -477,8 +477,8 @@ class GektorOrchestrator:
         if hasattr(self.tg, 'close'):
             try:
                 await self.tg.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[SHUTDOWN] Telegram close error (non-fatal): {e}")
 
         logger.critical("⬛ [SHUTDOWN] Teardown complete. All resources released.")
 

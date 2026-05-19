@@ -185,8 +185,8 @@ class TiltWebSocketHandler:
                     "reason": "COGNITIVE_OVERLOAD",
                     "score": metrics.composite_score,
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"[TILT] Failed to publish lockout event: {e}")
 
         elif new_state == TiltState.BLIND:
             logger.warning(f"👁️ [TILT] Operator '{self._operator_id}' went BLIND (WS silent)")

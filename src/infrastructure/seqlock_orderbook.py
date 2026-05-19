@@ -103,8 +103,8 @@ class HFTSeqlockOrderBook:
         """Освобождение ресурсов (вызывается при Graceful Shutdown)."""
         try:
             self.shm.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[SHM] Close error for seqlock segment (non-fatal): {e}")
 
     def unlink(self) -> None:
         """

@@ -137,7 +137,7 @@ class WorkerPoolManager:
         try:
             pool.shutdown(wait=True)
         except Exception as e:
-            pass
+            logger.warning(f"[PoolManager] Old pool shutdown error: {e}")
 
     def shutdown_all(self):
         self._running = False

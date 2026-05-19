@@ -35,7 +35,8 @@ class DedicatedSpilloverWriter:
                 f.flush()
                 try:
                     os.fsync(f.fileno())  # жёсткая гарантия записи на диск
-                except: pass 
+                except OSError as fsync_err:
+                    logger.warning(f"[Spillover] fsync failed (non-fatal): {fsync_err}")
         except OSError as e:
             logger.error(f"🚨 [Spillover] CRITICAL FILE I/O ERROR: {e}")
 
