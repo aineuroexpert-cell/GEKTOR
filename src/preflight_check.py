@@ -36,7 +36,7 @@ class GektorPreflightGuardian:
         
         # Симуляция Zero-Copy моста
         shm_instance = SHMOrderBook()
-        mem_view = memoryview(shm_instance)
+        mem_view = memoryview(shm_instance).cast('B')
         
         start_ns = time.perf_counter_ns()
         for _ in range(100_000):
