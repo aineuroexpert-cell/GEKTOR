@@ -7,7 +7,7 @@ services:
     container_name: gektor_core_apex
     restart: always
     environment:
-      - DATABASE_URL=postgresql://tekton_admin:CRITICAL_SECURE_PASSWORD_CHANGE_IMMEDIATELY_9912@blackbox_db/tekton_alpha
+      - DATABASE_URL=postgresql://tekton_admin:${POSTGRES_PASSWORD}@blackbox_db/tekton_alpha
       - REDIS_URL=redis://nerve_center/0
     volumes:
       # [TWO-TIER TIME SYNC] Жесткая привязка к часам хоста
@@ -29,7 +29,7 @@ services:
     restart: always
     environment:
       - POSTGRES_USER=tekton_admin
-      - POSTGRES_PASSWORD=CRITICAL_SECURE_PASSWORD_CHANGE_IMMEDIATELY_9912
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=tekton_alpha
     ports:
       - "127.0.0.1:5433:5432"
@@ -47,7 +47,7 @@ services:
     image: redis:7-alpine
     container_name: gektor_nerve_center
     restart: always
-    command: redis-server --appendonly yes --appendfsync everysec --requirepass CRITICAL_SECURE_PASSWORD_CHANGE_IMMEDIATELY_9912
+    command: redis-server --appendonly yes --appendfsync everysec --requirepass ${REDIS_PASSWORD}
     volumes:
       - gektor_redis_data:/data
 

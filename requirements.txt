@@ -1,6 +1,5 @@
 # GEKTOR APEX v4.0 ULTIMATUM - Requirements
 # Core
-asyncio==3.4.3
 aiohttp[speedups]==3.9.1
 aiohttp-socks==0.8.4
 asyncpg==0.29.0

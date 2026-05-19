@@ -125,15 +125,16 @@ class TelegramRadarNotifier:
                                 # Catch ProxyConnectionError and any aiohttp transport errors
                                 logger.error(f"🚨 [Telegram] Alert failed! Exception: {repr(e)}")
 
-                            self._queue.task_done()
+                            try:
+                                self._queue.task_done()
+                            except ValueError as ve:
+                                logger.error(f"🚨 [TG_WORKER] Value error on task done: {ve}")
                             await asyncio.sleep(0.3)
 
                         except asyncio.CancelledError:
                             return
                         except Exception as e:
                             logger.error(f"💥 [TG_WORKER] Inner loop error: {type(e).__name__}: {e}")
-                            try: self._queue.task_done()
-                            except ValueError: pass
                             await asyncio.sleep(2.0)
 
             except asyncio.CancelledError:

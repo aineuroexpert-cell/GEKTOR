@@ -3,6 +3,7 @@ import os
 import time
 from typing import List, Dict, Any
 from loguru import logger
+import asyncio
 
 class AtomicFlightRecorder:
     """
@@ -50,17 +51,7 @@ class AtomicFlightRecorder:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
 
-    def log_intent(
-        self,
-        cl_ord_id: str,
-        symbol: str,
-        side: str,
-        qty: float,
-        price: float,
-        *,
-        pre_flight_msq_price: float = 0.0,
-    ):
-        """Pre-flight recording. Must happen BEFORE the API call."""
+    def _sync_log_intent(self, cl_ord_id: str, symbol: str, side: str, qty: float, price: float, pre_flight_msq_price: float):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
@@ -72,8 +63,20 @@ class AtomicFlightRecorder:
         except Exception as e:
             logger.error(f"💀 [FLIGHT_RECORDER] Write Failure: {e}")
 
-    def mark_dispatched(self, cl_ord_id: str):
-        """Update status when API returns a definitive response."""
+    async def log_intent(
+        self,
+        cl_ord_id: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float,
+        *,
+        pre_flight_msq_price: float = 0.0,
+    ):
+        """Pre-flight recording. Must happen BEFORE the API call."""
+        await asyncio.to_thread(self._sync_log_intent, cl_ord_id, symbol, side, qty, price, pre_flight_msq_price)
+
+    def _sync_mark_dispatched(self, cl_ord_id: str):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
@@ -84,11 +87,11 @@ class AtomicFlightRecorder:
         except Exception as e:
             logger.error(f"💀 [FLIGHT_RECORDER] Update Failure: {e}")
 
-    def mark_filled(self, cl_ord_id: str, execution_price: float):
-        """
-        Record actual fill price for Network Decay audit (López de Prado).
-        Drift = |execution_price - pre_flight_msq_price| reveals systematic alpha erosion.
-        """
+    async def mark_dispatched(self, cl_ord_id: str):
+        """Update status when API returns a definitive response."""
+        await asyncio.to_thread(self._sync_mark_dispatched, cl_ord_id)
+
+    def _sync_mark_filled(self, cl_ord_id: str, execution_price: float):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
@@ -99,8 +102,14 @@ class AtomicFlightRecorder:
         except Exception as e:
             logger.error(f"💀 [FLIGHT_RECORDER] Fill Record Failure: {e}")
 
-    def mark_terminal(self, cl_ord_id: str):
-        """Remove or mark as finished when WS confirms the order is done."""
+    async def mark_filled(self, cl_ord_id: str, execution_price: float):
+        """
+        Record actual fill price for Network Decay audit (López de Prado).
+        Drift = |execution_price - pre_flight_msq_price| reveals systematic alpha erosion.
+        """
+        await asyncio.to_thread(self._sync_mark_filled, cl_ord_id, execution_price)
+
+    def _sync_mark_terminal(self, cl_ord_id: str):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 # We delete to keep the DB small and the 'Purgatory' scan fast
@@ -108,8 +117,11 @@ class AtomicFlightRecorder:
         except Exception as e:
             logger.error(f"💀 [FLIGHT_RECORDER] Cleanup Failure: {e}")
 
-    def get_unresolved_intents(self) -> List[Dict[str, Any]]:
-        """Used during Boot-Time Purgatory and Reconnect Reconciliation."""
+    async def mark_terminal(self, cl_ord_id: str):
+        """Remove or mark as finished when WS confirms the order is done."""
+        await asyncio.to_thread(self._sync_mark_terminal, cl_ord_id)
+
+    def _sync_get_unresolved(self) -> List[Dict[str, Any]]:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -121,10 +133,17 @@ class AtomicFlightRecorder:
             logger.error(f"💀 [FLIGHT_RECORDER] Read Failure: {e}")
             return []
 
-    def graceful_shutdown(self):
-        """Flush WAL on clean shutdown."""
+    async def get_unresolved_intents(self) -> List[Dict[str, Any]]:
+        """Used during Boot-Time Purgatory and Reconnect Reconciliation."""
+        return await asyncio.to_thread(self._sync_get_unresolved)
+
+    def _sync_graceful_shutdown(self):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception as e:
             logger.error(f"💀 [FLIGHT_RECORDER] Shutdown Failure: {e}")
+
+    async def graceful_shutdown(self):
+        """Flush WAL on clean shutdown."""
+        await asyncio.to_thread(self._sync_graceful_shutdown)

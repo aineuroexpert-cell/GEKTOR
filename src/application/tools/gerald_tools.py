@@ -165,44 +165,91 @@ async def tool_list_directory(args: dict) -> ToolResult:
 
 
 # ─────────────────────────────────────────────────────────
-# Tool: sniper_stats (queries the Sniper DB)
+# Database Helper: Read-Only Executor
+# ─────────────────────────────────────────────────────────
+async def _execute_read_safe(db, query: str, params: dict = None, timeout_ms: int = 2000) -> list[dict]:
+    """Execute a strictly read-only query on the DatabaseManager session."""
+    from sqlalchemy import text
+    import asyncio
+    
+    async with db.SessionLocal() as session:
+        # We wrap execution in an asyncio timeout to guarantee context safety
+        try:
+            res = await asyncio.wait_for(session.execute(text(query), params or {}), timeout=timeout_ms / 1000.0)
+            return [dict(row) for row in res.mappings()]
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Database query exceeded deadline of {timeout_ms}ms.")
+
+# ─────────────────────────────────────────────────────────
+# Tool: sniper_stats (queries the Signals DB)
 # ─────────────────────────────────────────────────────────
 async def tool_sniper_stats(args: dict) -> ToolResult:
-    """Query Gerald Sniper performance statistics."""
-    import sys
-    sniper_path = os.path.join("c:\\Gerald-superBrain", "skills", "gerald-sniper")
-    if sniper_path not in sys.path:
-        sys.path.insert(0, sniper_path)
+    """Query system signal and performance statistics."""
+    from src.infrastructure.database import DatabaseManager
+    db = DatabaseManager()
+    await db.initialize()
     
+    action = args.get("action", "stats")
     try:
-        from data.database import DatabaseManager
-        db = DatabaseManager()
-        await db.initialize()
-        
-        action = args.get("action", "stats")
-        
         if action == "stats":
             days = args.get("days", 30)
-            stats = await db.get_alert_stats(days=days)
+            is_sqlite = "sqlite" in str(db.engine.url)
+            if is_sqlite:
+                offset_str = f"-{days} days"
+                rows = await _execute_read_safe(db, """
+                    SELECT COUNT(*) as total_signals,
+                           AVG(entry_vwap) as avg_entry_vwap,
+                           AVG(exit_vpin) as avg_exit_vpin
+                    FROM signals
+                    WHERE created_at > datetime('now', :offset)
+                """, {"offset": offset_str})
+            else:
+                rows = await _execute_read_safe(db, f"""
+                    SELECT COUNT(*) as total_signals,
+                           AVG(entry_vwap) as avg_entry_vwap,
+                           AVG(exit_vpin) as avg_exit_vpin
+                    FROM signals
+                    WHERE created_at > NOW() - interval '{days} days'
+                """)
+            stats = rows[0] if rows else {"total_signals": 0, "avg_entry_vwap": None, "avg_exit_vpin": None}
             return ToolResult(success=True, output=json.dumps(stats, ensure_ascii=False, indent=2))
         
         elif action == "recent":
             limit = min(args.get("limit", 10), 50)
-            alerts = await db.get_recent_alerts(days=args.get("days", 7), limit=limit)
-            return ToolResult(success=True, output=json.dumps(alerts, ensure_ascii=False, indent=2))
+            rows = await _execute_read_safe(db, f"SELECT * FROM signals ORDER BY created_at DESC LIMIT {limit}")
+            return ToolResult(success=True, output=json.dumps(rows, ensure_ascii=False, indent=2, default=str))
         
         elif action == "symbol":
             symbol = args.get("symbol", "BTCUSDT")
-            # This is a custom query since DatabaseManager doesn't have it yet for Postgres
-            async with db.SessionLocal() as session:
-                from sqlalchemy import text
-                stmt = text("SELECT * FROM alerts WHERE symbol = :sym ORDER BY timestamp DESC LIMIT 10")
-                res = await session.execute(stmt, {"sym": symbol})
-                rows = [dict(row) for row in res.mappings()]
-            return ToolResult(success=True, output=json.dumps(rows, ensure_ascii=False, indent=2))
+            rows = await _execute_read_safe(db, "SELECT * FROM signals WHERE symbol = :sym ORDER BY created_at DESC LIMIT 10", {"sym": symbol})
+            return ToolResult(success=True, output=json.dumps(rows, ensure_ascii=False, indent=2, default=str))
         
         elif action == "weekly":
-            report = await db.get_weekly_summary()
+            is_sqlite = "sqlite" in str(db.engine.url)
+            if is_sqlite:
+                rows = await _execute_read_safe(db, """
+                    SELECT symbol, COUNT(*) as count, AVG(exit_vpin) as avg_vpin 
+                    FROM signals 
+                    WHERE created_at > datetime('now', '-7 days')
+                    GROUP BY symbol 
+                    ORDER BY count DESC
+                """)
+            else:
+                rows = await _execute_read_safe(db, """
+                    SELECT symbol, COUNT(*) as count, AVG(exit_vpin) as avg_vpin 
+                    FROM signals 
+                    WHERE created_at > NOW() - interval '7 days'
+                    GROUP BY symbol 
+                    ORDER BY count DESC
+                """)
+            report = "📊 **WEEKLY SIGNAL SUMMARY**\n\n"
+            if not rows:
+                report += "No signals recorded in the last 7 days."
+            else:
+                for r in rows:
+                    avg_vpin_val = r.get('avg_vpin')
+                    avg_vpin = f"{avg_vpin_val:.4f}" if avg_vpin_val is not None else "N/A"
+                    report += f"• **{r['symbol']}**: {r['count']} signals (Avg exit VPIN: {avg_vpin})\n"
             return ToolResult(success=True, output=report)
         
         else:
@@ -211,77 +258,58 @@ async def tool_sniper_stats(args: dict) -> ToolResult:
     except Exception as e:
         logger.error(f"sniper_stats tool error: {e}")
         return ToolResult(success=False, output="", error=str(e))
+    finally:
+        await db.close()
 
 
 # ─────────────────────────────────────────────────────────
 # Tool: get_watchlist_history (Requested by Commander)
 # ─────────────────────────────────────────────────────────
 async def tool_get_watchlist_history(args: dict) -> ToolResult:
-    """Returns top candidates from watchlist_history (TEKTON_ALPHA database)."""
-    import sys
-    sniper_path = os.path.join("c:\\Gerald-superBrain", "skills", "gerald-sniper")
-    if sniper_path not in sys.path:
-        sys.path.insert(0, sniper_path)
-        
+    """Returns top candidates from signals database."""
+    from src.infrastructure.database import DatabaseManager
+    db = DatabaseManager()
+    await db.initialize()
+    
     try:
-        from data.database import DatabaseManager
-        db = DatabaseManager()
-        await db.initialize()
-        
-        # PRO-ARCHITECTURE: Validation on limit to prevent DoS
         limit = min(max(int(args.get("limit", 10)), 1), 50)
-        
-        rows = await db.execute_read_safe("""
-            SELECT symbol, score, metrics, timestamp 
-            FROM watchlist_history 
-            ORDER BY timestamp DESC LIMIT :limit
-        """, {"limit": limit})
-        
-        # Formatting JSON for better readability in LLM context
-        for r in rows:
-            if 'timestamp' in r:
-                r['timestamp'] = str(r['timestamp'])
-        
-        return ToolResult(success=True, output=json.dumps(rows, ensure_ascii=False, indent=2))
+        rows = await _execute_read_safe(db, f"""
+            SELECT symbol, entry_vwap as price, exit_vpin as score, created_at as timestamp 
+            FROM signals 
+            ORDER BY created_at DESC LIMIT {limit}
+        """)
+        return ToolResult(success=True, output=json.dumps(rows, ensure_ascii=False, indent=2, default=str))
     except Exception as e:
         return ToolResult(success=False, output="", error=str(e))
+    finally:
+        await db.close()
 
 
 # ─────────────────────────────────────────────────────────
 # Tool: execute_sql (Direct Database Access)
 # ─────────────────────────────────────────────────────────
 async def tool_execute_sql(args: dict) -> ToolResult:
-    """Executes a strictly read-only SQL SELECT query on TEKTON_ALPHA database."""
+    """Executes a strictly read-only SQL SELECT query on the Gektor database."""
     query = args.get("query", "").strip()
     if not query:
         return ToolResult(success=False, output="", error="SQL query is required")
         
-    # Gektor Rule: Strict Read-Only & Performance Enforcement
     query_upper = query.upper()
     forbidden = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE", "GRANT", "REVOKE"]
     
     if any(keyword in query_upper for keyword in forbidden) or not query_upper.startswith("SELECT"):
         return ToolResult(success=False, output="", error="ACCESS DENIED: GERALD operates strictly in Read-Only SELECT mode.")
 
-    # Task 3.1: Context Window Protection (Mandatory Limit)
     if "LIMIT" not in query_upper:
         query = query.rstrip(";") + " LIMIT 50"
         logger.warning(f"SQL Policy: Appending MANDATORY LIMIT 50 to query.")
 
-    import sys
-    sniper_path = os.path.join("c:\\Gerald-superBrain", "skills", "gerald-sniper")
-    if sniper_path not in sys.path:
-        sys.path.insert(0, sniper_path)
-        
+    from src.infrastructure.database import DatabaseManager
+    db = DatabaseManager()
+    await db.initialize()
+    
     try:
-        from data.database import DatabaseManager
-        db = DatabaseManager()
-        await db.initialize()
-        
-        # SAFE EXECUTION with 2s timeout and READ ONLY status
-        rows = await db.execute_read_safe(query, timeout_ms=2000)
-        
-        # MEMORY PROTECTION: 1MB Max response size for serialization
+        rows = await _execute_read_safe(db, query, timeout_ms=2000)
         result_str = json.dumps(rows, ensure_ascii=False, indent=2, default=str)
         if len(result_str) > 1_000_000:
             return ToolResult(
@@ -291,8 +319,6 @@ async def tool_execute_sql(args: dict) -> ToolResult:
             
         return ToolResult(success=True, output=result_str)
     except Exception as e:
-        # [NERVE REPAIR v4.4] LLM Self-Correction Mechanism
-        # If the model hallucinates columns, we provide the exact DDL to force correction.
         error_msg = str(e)
         logger.error(f"SQL Tool failure: {error_msg}")
         return ToolResult(
@@ -300,17 +326,17 @@ async def tool_execute_sql(args: dict) -> ToolResult:
             output="", 
             error=(
                 f"SQL EXECUTION ERROR: {error_msg}\n\n"
-                f"🚨 SYSTEM REMINDER - VALID SCHEMA FOR 'watchlist_history':\n"
-                f"Columns: id, timestamp, symbol, score, price, volume_24h, volume_spike, liquidity_tier, metrics\n"
-                f"Note: Use 'score' (REAL) for filtering, NOT 'scoring'.\n"
-                f"Note: 'metrics' is a JSONB column containing complex data.\n"
+                f"🚨 SYSTEM REMINDER - VALID SCHEMA FOR 'signals':\n"
+                f"Columns: id, signal_id, symbol, state, entry_bid, entry_ask, entry_vwap, exit_bid, exit_ask, exit_vwap, human_entry_bid, human_entry_ask, human_entry_vwap, exit_vpin, created_at\n"
                 f"FIX YOUR QUERY (ONLY SELECT ALLOWED) AND RETRY."
             )
         )
+    finally:
+        await db.close()
 
 
 # ─────────────────────────────────────────────────────────
-# Tool: system_info (Restored)
+# Tool: system_info
 # ─────────────────────────────────────────────────────────
 async def tool_system_info(args: dict) -> ToolResult:
     """Get system information (time, disk, processes)."""
@@ -343,6 +369,7 @@ async def tool_system_info(args: dict) -> ToolResult:
             return ToolResult(success=False, output="", error=str(e))
     return ToolResult(success=False, output="", error=f"Unknown info type: {info_type}")
 
+
 # ─────────────────────────────────────────────────────────
 # Alpha Analytics: HFT Thread Isolation (V2.0.7 - Zero Pickle Risk)
 # ─────────────────────────────────────────────────────────
@@ -350,18 +377,15 @@ import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
-# Pandas vectorization releases the GIL. ThreadPool avoids IPC/Pickle overhead.
 MATH_POOL = ThreadPoolExecutor(max_workers=4)
 
 def _compute_alpha_metrics_v7(raw_rows, threshold_z):
     """Normalized Math Engine: Thread-isolated, primitive-safe."""
     try:
         import pandas as pd
-        # Primitive input ensures ZERO asyncpg.Record leakage
         df = pd.DataFrame(raw_rows, columns=['bucket', 'alt_price', 'spike', 'btc_price'])
         if len(df) < 15: return None
         
-        # 1. Statistical Volume Z-Score
         mu = df['spike'].mean()
         sigma = df['spike'].std()
         if sigma == 0: return None
@@ -369,8 +393,6 @@ def _compute_alpha_metrics_v7(raw_rows, threshold_z):
         last_spike = df['spike'].iloc[-1]
         z_score = (last_spike - mu) / sigma
         
-        # 2. Dynamic RS (Relative Strength) - Pulse Detection
-        # RS_5m captures short-term velocity; RS_15m captures trend strength
         df['alt_ret_5m'] = df['alt_price'].pct_change(periods=5)
         df['btc_ret_5m'] = df['btc_price'].pct_change(periods=5)
         df['rs_5m'] = df['alt_ret_5m'] - df['btc_ret_5m']
@@ -382,7 +404,6 @@ def _compute_alpha_metrics_v7(raw_rows, threshold_z):
         rs_5m = df['rs_5m'].iloc[-1]
         rs_15m = df['rs_15m'].iloc[-1]
         
-        # Decision Matrix: Alpha confirmed if RS_5m > 0.5% during Volume Spike
         if z_score > threshold_z and rs_5m > 0.005:
             return {
                 "z_score": round(z_score, 2),
@@ -402,15 +423,34 @@ async def tool_analyze_market_alpha(args: dict) -> ToolResult:
     - Dynamic RS Pulse Detection (5m/15m)
     """
     import asyncio
+    from src.infrastructure.database import DatabaseManager
+    db = DatabaseManager()
+    await db.initialize()
+    
     try:
-        import sys
-        sniper_path = os.path.join("c:\\Gerald-superBrain", "skills", "gerald-sniper")
-        if sniper_path not in sys.path:
-            sys.path.insert(0, sniper_path)
-        from data.database import DatabaseManager
-        db = DatabaseManager()
-        await db.initialize()
-        
+        # Check if watchlist_history table exists
+        is_sqlite = "sqlite" in str(db.engine.url)
+        table_exists = False
+        if is_sqlite:
+            res = await _execute_read_safe(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='watchlist_history'")
+            table_exists = len(res) > 0
+        else:
+            res = await _execute_read_safe(db, "SELECT tablename FROM pg_tables WHERE tablename='watchlist_history'")
+            table_exists = len(res) > 0
+            
+        if not table_exists:
+            # Fallback report using signals table
+            rows = await _execute_read_safe(db, "SELECT symbol, COUNT(*) as count FROM signals GROUP BY symbol ORDER BY count DESC")
+            report = f"🧪 **HFT ALPHA ANALYSIS (V2.0.7) - ADVISORY MODE**\n"
+            report += f"📊 Note: 'watchlist_history' is not initialized. Using signals table data.\n\n"
+            if not rows:
+                report += "✅ Market Observation: No active signals recorded in the database yet."
+            else:
+                report += "Recent activity by symbol:\n"
+                for r in rows:
+                    report += f"• **{r['symbol']}**: {r['count']} historical signals detected.\n"
+            return ToolResult(success=True, output=report)
+            
         z_threshold = float(args.get("z_threshold", 2.5))
         hours = min(max(int(args.get("hours", 2)), 1), 12)
         symbols = args.get("symbols", [])
@@ -418,7 +458,7 @@ async def tool_analyze_market_alpha(args: dict) -> ToolResult:
         
         if not symbols:
             # Auto-pick recently active Tier A/B candidates (Normalized Columns)
-            active = await db.execute_read_safe("""
+            active = await _execute_read_safe(db, """
                 SELECT DISTINCT symbol FROM watchlist_history 
                 WHERE timestamp > NOW() - interval '1 hour'
                   AND liquidity_tier IN ('A', 'B')
@@ -461,7 +501,7 @@ async def tool_analyze_market_alpha(args: dict) -> ToolResult:
                 ORDER BY a.bucket ASC;
             """
             
-            rows = await db.execute_read_safe(query, {"sym": symbol, "h": hours})
+            rows = await _execute_read_safe(db, query, {"sym": symbol, "h": hours})
             if not rows or len(rows) < 20: continue
 
             # DATA CLEANING: Convert asyncpg.Record to Primitives (Pickle-safe)
@@ -485,6 +525,8 @@ async def tool_analyze_market_alpha(args: dict) -> ToolResult:
         
     except Exception as e:
         return ToolResult(success=False, output="", error=f"Alpha Pipeline Failure: {str(e)}")
+    finally:
+        await db.close()
 
 # ─────────────────────────────────────────────────────────
 # Tool Registry (V2.0.6 - Final)
@@ -506,8 +548,8 @@ TOOL_DESCRIPTIONS = (
     "3. search_files(query: str) — Поиск файлов в проекте.\n"
     "4. list_directory(path: str) — Список файлов в папке.\n"
     "5. analyze_market_alpha(z_threshold?: float, symbols?: list[str]) — ПОИСК ИСТИННОЙ АЛЬФЫ (RS vs BTC). Ищет лидеров рынка.\n"
-    "6. get_watchlist_history(limit: int = 5) — Последние записи вочлиста.\n"
-    "7. execute_sql(query: str) — Прямой SELECT к базе (Лимит 2с). Таблица watchlist_history имеет колонки: id, timestamp, symbol, score, price, volume_24h, volume_spike, liquidity_tier, metrics. Используй 'score' (НЕ 'scoring').\n"
+    "6. get_watchlist_history(limit: int = 5) — Последние записи вочлиста/сигналов.\n"
+    "7. execute_sql(query: str) — Прямой SELECT к базе (Лимит 2с). Таблица signals имеет колонки: id, signal_id, symbol, state, entry_bid, entry_ask, entry_vwap, exit_bid, exit_ask, exit_vwap, human_entry_bid, human_entry_ask, human_entry_vwap, exit_vpin, created_at.\n"
     "8. sniper_stats(action: str) — Статистика Снайпера (stats, recent, weekly).\n"
     "9. system_info(type: str) — Ресурсы системы (general, processes).\n"
 )

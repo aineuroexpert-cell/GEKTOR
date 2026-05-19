@@ -171,30 +171,7 @@ class BybitRestClient:
             logger.error(f"💥 [REST] Position fetch failure: {e}")
             return {}
 
-    async def place_order(self, **kwargs) -> dict:
-        """[ATOMIC EXECUTION] Direct Order placement via Bybit V5 Private REST API."""
-        try:
-            timestamp = str(int(time.time() * 1000))
-            payload = orjson.dumps(kwargs).decode('utf-8')
-            signature = self._generate_signature(timestamp, payload)
-            headers = {
-                "X-BAPI-API-KEY": self.api_key or "",
-                "X-BAPI-SIGN": signature,
-                "X-BAPI-TIMESTAMP": timestamp,
-                "X-BAPI-RECV-WINDOW": "5000",
-                "Content-Type": "application/json"
-            }
-            session = await self._get_session()
-            url = f"{self.base_url}/v5/order/create"
-            async with session.post(url, headers=headers, data=payload, timeout=5) as resp:
-                raw = await resp.read()
-                data = orjson.loads(raw)
-                if data.get("retCode") != 0:
-                    logger.critical(f"🛑 [BYBIT API ERROR] Execution Failed: {data.get('retMsg')} | Payload: {payload}")
-                return data
-        except Exception as e:
-            logger.critical(f"🛑 [BYBIT API ERROR] Execution I/O Fatal: {e} | Payload: {kwargs}")
-            return {"retCode": -1, "retMsg": str(e)}
+
 
     async def get_trade_history(self, symbol: str, limit: int = 5) -> dict:
         """[CAUSAL RECOVERY] Fetches recent execution history for a symbol."""
