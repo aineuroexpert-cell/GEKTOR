@@ -193,5 +193,5 @@ class EventBus:
             self.db.execute("DELETE FROM outbox WHERE status='PROCESSED'")
             self.db.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             self.db.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[EventBus] Shutdown cleanup error (non-fatal): {e}")

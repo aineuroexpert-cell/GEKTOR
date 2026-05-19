@@ -1,138 +1,136 @@
 # src/domain/dollar_bar.py
-from dataclasses import dataclass, field
+"""
+[GEKTOR DOCTRINE] All price/volume calculations use decimal.Decimal.
+IEEE 754 floats are PROHIBITED for financial math.
+
+DollarBar is the single canonical dataclass defined in conflation.py.
+This module re-exports it and provides RealtimeDollarBarGenerator.
+"""
+from decimal import Decimal
 from typing import List, Optional, Callable, Coroutine, Any
 import asyncio
 from loguru import logger
 
-@dataclass(slots=True)
-class DollarBar:
-    symbol: str
-    open_price: float
-    high_price: float
-    low_price: float
-    close_price: float
-    volume_base: float
-    volume_quote: float  # The USD volume (Threshold metric)
-    buy_volume_quote: float
-    sell_volume_quote: float
-    tick_count: int
-    start_timestamp: float
-    end_timestamp: float
-    # [GEKTOR v21.68] Microstructure Integrity Metrics
-    ofi_accum: float = 0.0  # Order Flow Imbalance (LOB Pressure)
-    vpin: float = 0.0       # Volume-synchronous Probability of Informed Trading
+from src.domain.conflation import DollarBar
+
+
+ZERO = Decimal('0')
+ONE = Decimal('1')
+
 
 class RealtimeDollarBarGenerator:
     """
     [GEKTOR v21.68] Information-Driven Bar Generator (Dollar Bars).
-    
-    Now tracks LOB Pressure (OFI) to distinguish between Aggressive Trades 
-    and OTC/Cross-Trade 'tape prints'.
+
+    All arithmetic uses decimal.Decimal per Manifesto.
+    Tracks LOB Pressure (OFI) to distinguish Aggressive Trades
+    from OTC/Cross-Trade tape prints.
     """
     __slots__ = ['symbol', 'threshold_usd', '_current_bar']
 
-    def __init__(self, symbol: str, threshold_usd: float):
+    def __init__(self, symbol: str, threshold_usd: Decimal):
         self.symbol = symbol
         self.threshold_usd = threshold_usd
         self._current_bar: Optional[DollarBar] = None
 
-    def process_tick(self, price: float, volume: float, side: str, ts: float, current_ofi: float = 0.0) -> List[DollarBar]:
-        """
-        Processes a single trade tick with synchronous OFI tracking.
-        """
+    def process_tick(
+        self, price: Decimal, volume: Decimal, side: str, ts: float, current_ofi: Decimal = ZERO
+    ) -> List[DollarBar]:
         volume_usd = price * volume
-        is_buy = str(side).upper() == "BUY"
-        completed_bars = []
+        is_buyer_maker = str(side).upper() != "BUY"
+        completed_bars: List[DollarBar] = []
 
-        while volume_usd > 0:
+        while volume_usd > ZERO:
             if not self._current_bar:
                 self._current_bar = DollarBar(
                     symbol=self.symbol,
-                    open_price=price, high_price=price, low_price=price, close_price=price,
-                    volume_base=0.0, volume_quote=0.0,
-                    buy_volume_quote=0.0, sell_volume_quote=0.0,
-                    tick_count=0, start_timestamp=ts, end_timestamp=ts,
-                    ofi_accum=0.0
+                    open=price, high=price, low=price, close=price,
+                    start_ts=ts,
                 )
 
-            available_capacity = self.threshold_usd - self._current_bar.volume_quote
-            
-            # Divide OFI proportionally if tick is sliced
-            chunk_ratio = min(1.0, available_capacity / volume_usd) if volume_usd > 0 else 1.0
+            available_capacity = self.threshold_usd - self._current_bar.volume_usd
+
+            chunk_ratio = min(ONE, available_capacity / volume_usd) if volume_usd > ZERO else ONE
             chunk_ofi = current_ofi * chunk_ratio
 
             if volume_usd <= available_capacity:
-                self._apply_chunk(self._current_bar, price, volume_usd, is_buy, ts, current_ofi)
-                if self._current_bar.volume_quote >= self.threshold_usd:
+                self._apply_chunk(self._current_bar, price, volume, volume_usd, is_buyer_maker, ts, current_ofi)
+                if self._current_bar.volume_usd >= self.threshold_usd:
                     completed_bars.append(self._current_bar)
                     self._current_bar = None
-                volume_usd = 0 
+                volume_usd = ZERO
             else:
-                self._apply_chunk(self._current_bar, price, available_capacity, is_buy, ts, chunk_ofi)
+                chunk_base = (available_capacity / price) if price > ZERO else ZERO
+                self._apply_chunk(self._current_bar, price, chunk_base, available_capacity, is_buyer_maker, ts, chunk_ofi)
                 completed_bars.append(self._current_bar)
                 self._current_bar = None
                 volume_usd -= available_capacity
-                current_ofi -= chunk_ofi # Remaining OFI for next bar
+                volume -= chunk_base
+                current_ofi -= chunk_ofi
 
         return completed_bars
 
-    def _apply_chunk(self, bar: DollarBar, price: float, vol_usd: float, is_buy: bool, ts: float, ofi: float):
-        bar.high_price = max(bar.high_price, price)
-        bar.low_price = min(bar.low_price, price)
-        bar.close_price = price
-        bar.volume_quote += vol_usd
-        bar.volume_base += (vol_usd / price) if price > 0 else 0
-        if is_buy:
-            bar.buy_volume_quote += vol_usd
+    @staticmethod
+    def _apply_chunk(
+        bar: DollarBar, price: Decimal, vol_base: Decimal, vol_usd: Decimal,
+        is_buyer_maker: bool, ts: float, ofi: Decimal,
+    ) -> None:
+        if price > bar.high:
+            bar.high = price
+        if price < bar.low:
+            bar.low = price
+        bar.close = price
+        bar.volume_usd += vol_usd
+        bar.volume_crypto += vol_base
+        if is_buyer_maker:
+            bar.sell_volume_usd += vol_usd
         else:
-            bar.sell_volume_quote += vol_usd
+            bar.buy_volume_usd += vol_usd
         bar.tick_count += 1
-        bar.end_timestamp = ts
-        bar.ofi_accum += ofi
+        bar.end_ts = ts
 
-from src.domain.conflation import AtomicBarConflator
 
 class CortexHandoffBridge:
     """
-    [GEKTOR v21.69] The "Bridge" with Atomic Conflation.
-    
-    Philosophy: "Data is Mass." 
-    Instead of dropping bars (mathematical crime), we fuse them during lag.
+    [GEKTOR v21.69] The "Bridge" — asynchronous handoff of completed bars to the quant engine.
+
+    Philosophy: "Data is Mass."
+    Instead of dropping bars (mathematical crime), we queue them during lag.
     """
     def __init__(self, cortex_callback: Callable[[Any], Coroutine[Any, Any, None]]):
-        self._conflator = AtomicBarConflator()
+        self._queue: asyncio.Queue[DollarBar] = asyncio.Queue(maxsize=4096)
         self._callback = cortex_callback
         self._worker_task: Optional[asyncio.Task] = None
         self._is_running = False
-        self._condition = asyncio.Condition()
 
-    async def start(self):
-        if self._is_running: return
+    async def start(self) -> None:
+        if self._is_running:
+            return
         self._is_running = True
         self._worker_task = asyncio.create_task(self._worker_loop())
-        logger.success("🧠 [CORTEX] Atomic Bridge active. State integrity guaranteed.")
+        logger.success("[CORTEX] Atomic Bridge active. State integrity guaranteed.")
 
-    async def _worker_loop(self):
+    async def _worker_loop(self) -> None:
         while self._is_running:
             try:
-                bar = self._conflator.pop_bar()
-                if bar:
-                    # Execute math on fused data
-                    await self._callback(bar)
-                else:
-                    await asyncio.sleep(0.001) # Low-latency poll
+                bar = await asyncio.wait_for(self._queue.get(), timeout=0.01)
+                await self._callback(bar)
+            except asyncio.TimeoutError:
+                continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"💥 [CORTEX] Math Failure: {e}")
+                logger.error(f"[CORTEX] Math Failure: {e}")
                 await asyncio.sleep(0.01)
 
-    def enqueue_bars(self, bars: List[DollarBar]):
-        """Non-blocking injection via Conflator."""
+    def enqueue_bars(self, bars: List[DollarBar]) -> None:
         for bar in bars:
-            self._conflator.push_bar(bar.close_price, bar.volume_quote, bar.ofi_accum)
+            try:
+                self._queue.put_nowait(bar)
+            except asyncio.QueueFull:
+                logger.warning("[CORTEX] Bar queue full, dropping oldest bar (lossy mode)")
 
-    async def stop(self):
+    async def stop(self) -> None:
         self._is_running = False
         if self._worker_task:
             self._worker_task.cancel()
@@ -140,4 +138,4 @@ class CortexHandoffBridge:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-        logger.info("🔌 [CORTEX] Bridge shut down.")
+        logger.info("[CORTEX] Bridge shut down.")

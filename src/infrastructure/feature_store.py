@@ -402,13 +402,13 @@ class FeatureStore:
             try:
                 self._wal_mmap.flush()
                 self._wal_mmap.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[FeatureStore] WAL mmap close error: {e}")
         if self._wal_fd >= 0:
             try:
                 os.close(self._wal_fd)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[FeatureStore] WAL fd close error: {e}")
         self._wal_mmap = None
         self._wal_fd = -1
 

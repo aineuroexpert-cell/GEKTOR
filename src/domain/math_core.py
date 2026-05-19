@@ -1,5 +1,6 @@
 import time
 import logging
+from decimal import Decimal
 from typing import Optional, Dict, List, Tuple
 from loguru import logger
 
@@ -86,7 +87,7 @@ def process_ticks_subroutine(symbol: str, batch: List[dict], target_volume: floa
     calculates VPIN metrics, and returns the results + updated state.
     """
     # 1. Rehydrate Engines
-    generator = RealtimeDollarBarGenerator(symbol, target_volume)
+    generator = RealtimeDollarBarGenerator(symbol, Decimal(str(target_volume)))
     window_z = alpha.VPIN_WINDOW_SIZE
     engine = O1VPINEngine(window_size=window_z, volume_threshold=target_volume, z_threshold=alpha.VPIN_ANOMALY_Z)
     
@@ -113,8 +114,8 @@ def process_ticks_subroutine(symbol: str, batch: List[dict], target_volume: floa
     for tick in batch:
         # Expected tick format: {'p': price, 'v': volume, 'm': is_buyer_maker, 'T': ts}
         # Or Bybit format: {'price': p, 'volume': v, 'side': s, 'timestamp': ts}
-        p = float(tick.get('p') or tick.get('price', 0))
-        v = float(tick.get('v') or tick.get('volume', 0))
+        p = Decimal(str(tick.get('p') or tick.get('price', 0)))
+        v = Decimal(str(tick.get('v') or tick.get('volume', 0)))
         # Bybit 'side' covers 'Buy'/'Sell'. 
         # In Bybit WS, 'm' (isBuyerMaker) is usually true for Sell orders if it's from the trade topic.
         is_m = tick.get('m')
@@ -137,8 +138,8 @@ def process_ticks_subroutine(symbol: str, batch: List[dict], target_volume: floa
                     "z_score": signal.z_score,
                     "is_anomaly": signal.is_anomaly,
                     "absorption": signal.absorption_detected,
-                    "price": bar.close_price,
-                    "timestamp": bar.end_timestamp
+                    "price": float(bar.close),
+                    "timestamp": bar.end_ts
                 })
 
     # 3. Capture New State

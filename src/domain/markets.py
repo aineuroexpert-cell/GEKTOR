@@ -333,8 +333,8 @@ class StateMachineOrderBook:
         if hasattr(self, 'shm') and self.shm:
             try:
                 self.shm.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[SHM] Close error for {self.shm_name} (non-fatal): {e}")
             try:
                 self.shm.unlink()
                 logger.info(f"🗑️ [SHM] Segment '{self.shm_name}' unlinked.")

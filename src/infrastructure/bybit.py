@@ -120,37 +120,7 @@ class BybitRestClient:
             logger.error(f"⚠️ [BybitREST] Position fetch failed: {repr(e)}")
             return []
 
-    async def amend_order(self, order_id: str, price: str, symbol: str) -> bool:
-        """[HFT] Atomic Order repositioning."""
-        try:
-            timestamp = str(int(time.time() * 1000))
-            payload = orjson.dumps({
-                "category": "linear",
-                "symbol": symbol,
-                "orderId": order_id,
-                "price": price
-            }).decode('utf-8')
-            signature = self._generate_signature(timestamp, payload)
-            headers = {
-                "X-BAPI-API-KEY": self.api_key or "",
-                "X-BAPI-SIGN": signature,
-                "X-BAPI-TIMESTAMP": timestamp,
-                "X-BAPI-RECV-WINDOW": "5000",
-                "Content-Type": "application/json"
-            }
-            session = await self._get_session()
-            url = f"{self.base_url}/v5/order/amend"
-            async with session.post(url, headers=headers, data=payload, timeout=5) as resp:
-                raw = await resp.read()
-                data = orjson.loads(raw)
-                if data.get("retCode") == 0:
-                    return True
-                else:
-                    logger.error(f"❌ [Bybit] Amend Rejected: {data.get('retMsg')}")
-                    return False
-        except Exception as e:
-            logger.error(f"💥 [Bybit] Amend I/O Fallback: {e}")
-            return False
+    # [DOCTRINE] amend_order REMOVED — Auto-execution prohibited by GEKTOR Manifesto.
 
     async def get_positions(self, symbol: str) -> dict:
         """[RAM-Truth] Atomic Position Snapshot."""
@@ -171,30 +141,8 @@ class BybitRestClient:
             logger.error(f"💥 [REST] Position fetch failure: {e}")
             return {}
 
-    async def place_order(self, **kwargs) -> dict:
-        """[ATOMIC EXECUTION] Direct Order placement via Bybit V5 Private REST API."""
-        try:
-            timestamp = str(int(time.time() * 1000))
-            payload = orjson.dumps(kwargs).decode('utf-8')
-            signature = self._generate_signature(timestamp, payload)
-            headers = {
-                "X-BAPI-API-KEY": self.api_key or "",
-                "X-BAPI-SIGN": signature,
-                "X-BAPI-TIMESTAMP": timestamp,
-                "X-BAPI-RECV-WINDOW": "5000",
-                "Content-Type": "application/json"
-            }
-            session = await self._get_session()
-            url = f"{self.base_url}/v5/order/create"
-            async with session.post(url, headers=headers, data=payload, timeout=5) as resp:
-                raw = await resp.read()
-                data = orjson.loads(raw)
-                if data.get("retCode") != 0:
-                    logger.critical(f"🛑 [BYBIT API ERROR] Execution Failed: {data.get('retMsg')} | Payload: {payload}")
-                return data
-        except Exception as e:
-            logger.critical(f"🛑 [BYBIT API ERROR] Execution I/O Fatal: {e} | Payload: {kwargs}")
-            return {"retCode": -1, "retMsg": str(e)}
+    # [DOCTRINE] place_order REMOVED — Auto-execution prohibited by GEKTOR Manifesto.
+    # System generates Intent Capsules for manual operator confirmation only.
 
     async def get_trade_history(self, symbol: str, limit: int = 5) -> dict:
         """[CAUSAL RECOVERY] Fetches recent execution history for a symbol."""
@@ -217,31 +165,7 @@ class BybitRestClient:
             logger.error(f"💥 [Bybit] Trade History I/O Fallback: {e}")
             return {"retCode": -1, "retMsg": str(e)}
 
-    async def cancel_order(self, symbol: str, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> dict:
-        """[ATOMIC ABORT] Cancels an active order on the exchange."""
-        try:
-            timestamp = str(int(time.time() * 1000))
-            payload_dict = {"category": "linear", "symbol": symbol}
-            if order_id: payload_dict["orderId"] = order_id
-            if order_link_id: payload_dict["orderLinkId"] = order_link_id
-            
-            payload = orjson.dumps(payload_dict).decode('utf-8')
-            signature = self._generate_signature(timestamp, payload)
-            headers = {
-                "X-BAPI-API-KEY": self.api_key or "",
-                "X-BAPI-SIGN": signature,
-                "X-BAPI-TIMESTAMP": timestamp,
-                "X-BAPI-RECV-WINDOW": "5000",
-                "Content-Type": "application/json"
-            }
-            session = await self._get_session()
-            url = f"{self.base_url}/v5/order/cancel"
-            async with session.post(url, headers=headers, data=payload, timeout=5) as resp:
-                raw = await resp.read()
-                return orjson.loads(raw)
-        except Exception as e:
-            logger.error(f"💥 [Bybit] Cancel I/O Fatal: {e}")
-            return {"retCode": -1, "retMsg": str(e)}
+    # [DOCTRINE] cancel_order REMOVED — Auto-execution prohibited by GEKTOR Manifesto.
 
     async def get_open_orders(self, symbol: str) -> dict:
         """[RAM-Truth] Atomic Open Orders Snapshot."""
@@ -453,8 +377,8 @@ class BybitIngestor:
         if self._ws:
             try:
                 await self._ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[Ingestor] Socket close error during kill (non-fatal): {e}")
             self._ws = None
         self._invalidate_all_l2()
         logger.warning("🔌 [Ingestor] Socket force-killed. L2 state purged.")
@@ -767,8 +691,8 @@ class BybitIngestor:
         if self._ws and not self._ws.closed:
             try:
                 await self._ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[PrivateWS] Socket close error during stop (non-fatal): {e}")
             self._ws = None
 
         # Cancel background tasks

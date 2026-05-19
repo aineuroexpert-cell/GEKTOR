@@ -20,14 +20,12 @@ from src.infrastructure.telegram_notifier import TelegramRadarNotifier
 from src.infrastructure.bybit import BybitIngestor, PrivateBybitWSIngestor
 from src.infrastructure.bybit import BybitRestClient
 from src.infrastructure.event_bus import EventBus
-from src.infrastructure.state_healer import L6StateHealer
 from src.infrastructure.flight_recorder import AtomicFlightRecorder
 
 from src.application.pool_manager import WorkerPoolManager
 from src.application.sentinel_watchdog import event_loop_monitor
 from src.application.vanguard import VanguardScanner
 from src.application.microstructure import MicrostructureDefender, L2Snapshot, L2Level
-from src.application.layer6_autonomous import AutonomousExecutionGateway
 from src.application.quarantine import QuarantineManager
 from src.application.escrow import LiquidationEchoGuard
 from src.application.alpha_engine import ZeroAllocationEngine
@@ -238,12 +236,8 @@ class GektorOrchestrator:
         self.defenders = self.micro_defenders
         self.genesis_conflator = GenesisConflationEngineV4(self.macro_states, self.defenders, self.event_bus, self.watchdog)
 
-        self.l6_gateway = AutonomousExecutionGateway(
-            rest_client=self.rest_client, shadow_ledger=self.shadow_ledger,
-            rate_limiter=self.resilience, flight_recorder=self.flight_recorder
-        )
-
-        self.state_healer = L6StateHealer
+        # [DOCTRINE] AutonomousExecutionGateway and L6StateHealer REMOVED.
+        # GEKTOR is advisory-only. No auto-execution capability.
 
     def _launch_daemon(self, name: str, coro) -> None:
         """[SUPERVISION] Изолированный запуск бесконечных циклов."""
@@ -483,8 +477,8 @@ class GektorOrchestrator:
         if hasattr(self.tg, 'close'):
             try:
                 await self.tg.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[SHUTDOWN] Telegram close error (non-fatal): {e}")
 
         logger.critical("⬛ [SHUTDOWN] Teardown complete. All resources released.")
 
