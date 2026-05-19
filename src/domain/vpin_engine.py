@@ -49,9 +49,9 @@ class O1VPINEngine:
 
     def process_bar(self, bar: DollarBar) -> Optional[VPINSignal]:
         import time
-        buy_vol = bar.buy_volume_quote
-        sell_vol = bar.sell_volume_quote
-        price = bar.close_price
+        buy_vol = float(bar.buy_volume_usd)
+        sell_vol = float(bar.sell_volume_usd)
+        price = float(bar.close)
         
         imbalance = buy_vol - sell_vol
         abs_imbalance = abs(imbalance)
