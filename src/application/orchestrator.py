@@ -270,7 +270,7 @@ class GektorOrchestrator:
             blind_symbols = self.flatline_sentinel.check_for_flatlines(self.symbols)
             if blind_symbols:
                 for symbol in blind_symbols:
-                    asyncio.create_task(self.tg.notify_manual(f"🛑 <b>[ЧАСТИЧНАЯ СЛЕПОТА]</b> {symbol} flatlined."))
+                    asyncio.create_task(self.tg.notify_manual(f"🛑 <b>[ЧАСТИЧНАЯ СЛЕПОТА]</b> Поток данных {symbol} остановлен (Exchange Freeze)."))
 
     def send_critical_alert(self, message: str):
         """Callback for ingestor to report critical network/API failures."""

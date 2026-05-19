@@ -3,6 +3,10 @@ import sys
 import signal
 import logging
 from typing import NoReturn, Optional
+from datetime import datetime, timezone
+from src.infrastructure.config import settings
+from src.infrastructure.database import DatabaseManager
+from src.infrastructure.telegram_notifier import TelegramRadarNotifier
 
 # Настройка высокопроизводительного логгера
 logging.basicConfig(
@@ -20,6 +24,8 @@ class GektorRadarCore:
         self.env = env
         self._is_running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.db = DatabaseManager()
+        self.tg = TelegramRadarNotifier(db_manager=self.db, bot_token=settings.bot_token, chat_id=settings.chat_id)
 
     async def _alert_engine(self) -> None:
         """
@@ -45,6 +51,21 @@ class GektorRadarCore:
         self._is_running = True
         logger.info("[SYSTEM] Инициализация GEKTOR APEX (Advisory Mode)...")
         
+        # Инициализация Telegram-нотифиера
+        await self.tg.start()
+        
+        # Отправка стартового оповещения
+        await self.tg.notify_manual(
+            "🟢 <b>[GEKTOR APEX] Система выведена на орбиту</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📡 L2-Радар активен (Advisory Mode)\n"
+            f"🌍 Окружение: <code>{self.env}</code>\n"
+            f"⏰ <code>{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "✅ <b>СТАТУС: МОНИТОРИНГ ЗАПУЩЕН</b>",
+            "STARTUP"
+        )
+        
         # Запуск подсистем конкурентно
         await asyncio.gather(
             self._alert_engine(),
@@ -54,6 +75,24 @@ class GektorRadarCore:
     async def shutdown(self, sig: signal.Signals) -> None:
         logger.warning(f"[SYSTEM] Получен сигнал {sig.name}. Начат Graceful Shutdown.")
         self._is_running = False
+        
+        # Отправка оповещения о завершении
+        await self.tg.notify_manual(
+            f"🔴 <b>[GEKTOR APEX] Завершение работы</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧬 Причина: Сигнал <code>{sig.name}</code>\n"
+            f"⏰ <code>{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🛑 <b>СТАТУС: СИСТЕМА ОСТАНОВЛЕНА</b>",
+            "SHUTDOWN"
+        )
+        
+        # Ожидаем завершения отправки алертов из очереди
+        try:
+            await asyncio.timeout(3.0, self.tg._queue.join())
+        except Exception:
+            pass
+        await self.tg.stop()
         
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         [task.cancel() for task in tasks]
@@ -66,6 +105,24 @@ class GektorRadarCore:
     async def hot_reload(self) -> None:
         logger.warning("[SYSTEM] Получен сигнал SIGHUP. Запуск Hot Reload...")
         self._is_running = False
+        
+        # Отправка оповещения о горячей перезагрузке
+        await self.tg.notify_manual(
+            "🔄 <b>[GEKTOR APEX] Горячая перезагрузка</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ Выполняется перезапуск процесса (Hot Reload)...\n"
+            f"⏰ <code>{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⏳ <b>СТАТУС: ПЕРЕЗАПУСК</b>",
+            "SHUTDOWN"
+        )
+        
+        # Ожидаем завершения отправки алертов из очереди
+        try:
+            await asyncio.timeout(3.0, self.tg._queue.join())
+        except Exception:
+            pass
+        await self.tg.stop()
         
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         [task.cancel() for task in tasks]
