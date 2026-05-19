@@ -41,11 +41,11 @@ class TelegramRadarNotifier:
         self.db = db_manager
         self.bot_token = bot_token
         self.chat_id = chat_id
-        self.proxy_url = proxy_url or settings.TELEGRAM_PROXY
+        self.proxy_url = proxy_url or settings.TELEGRAM_PROXY or settings.TG_PROXY_URL or settings.PROXY_URL
         self.bus = event_bus
         self.api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         
-        logger.info(f"🔑 [Telegram] Token loaded: {bool(self.bot_token)}, Chat ID loaded: {bool(self.chat_id)}")
+        logger.info(f"🔑 [Telegram] Token loaded: {bool(self.bot_token)}, Chat ID: {bool(self.chat_id)}, Proxy: {self.proxy_url or 'NONE'}")
         
         # [PSR 4.0] TRANSACTIONAL OUTBOX (Persistence > Speed)
         self._wakeup_event = asyncio.Event()
@@ -96,9 +96,11 @@ class TelegramRadarNotifier:
                         try:
                             text, alert_type = await self._queue.get()
 
-                            if not self.debouncer.should_notify(alert_type):
-                                self._queue.task_done()
-                                continue
+                            # Системные и критические ручные алерты обходят дебаунсер спама
+                            if alert_type not in {"STARTUP", "SHUTDOWN", "SAFE_HOLD", "SYSTEM_ERROR", "DEFAULT"}:
+                                if not self.debouncer.should_notify(alert_type):
+                                    self._queue.task_done()
+                                    continue
 
                             payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
                             try:
