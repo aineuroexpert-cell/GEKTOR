@@ -285,6 +285,7 @@ class GektorOrchestrator:
         await self.event_bus.start()
         await self.db.initialize()
         await self.tg.start()
+        await self.resilience.start_shields()
         
         # 2. [EXORCISM] Bury zombie PENDING signals that drifted beyond threshold
         await self._exorcise_zombie_signals()
@@ -447,6 +448,7 @@ class GektorOrchestrator:
 
         # 1. Signal all loops to stop
         self._shutdown_event.set()
+        await self.resilience.stop_shields()
 
         # 2. Cancel daemon tasks with grace period
         all_tasks = list(self._daemon_tasks) + list(self._background_tasks)

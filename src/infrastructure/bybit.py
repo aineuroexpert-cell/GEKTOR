@@ -716,8 +716,10 @@ class BybitIngestor:
                 return
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
                 logger.error(f"🔌 [Bybit] WS transport error: {type(e).__name__}: {e}")
+                GlobalResilienceManager.get_instance().register_failure("BybitWS_Public")
             except Exception as e:
                 logger.error(f"🔌 [Bybit] WS reconnecting: {e}")
+                GlobalResilienceManager.get_instance().register_failure("BybitWS_Public")
 
             if self._running:
                 delay = min(60.0, 1.0 * (2 ** reconnect_attempt))
@@ -905,6 +907,7 @@ class PrivateBybitWSIngestor:
                 retry_count += 1
                 sleep_time = 2.0 if retry_count <= 3 else min(10.0, 2.0 * (1.2 ** (retry_count - 3)))
                 logger.error(f"❌ [PrivateWS] Reconnect #{retry_count} (Sleep: {sleep_time:.1f}s): {e}")
+                GlobalResilienceManager.get_instance().register_failure("BybitWS_Private")
                 if self._running: await asyncio.sleep(sleep_time)
             finally:
                 if session: await session.close()

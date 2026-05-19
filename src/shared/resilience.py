@@ -194,10 +194,148 @@ class PTPClock:
         """Возвращает синхронизированное время в наносекундах."""
         return time.time_ns() + self._offset_ns
 
+# ─────────────────────────────────────────────────────────
+# Echelon 22: AutoBug Shield (Self-Healing & Loop Starvation Monitoring)
+# ─────────────────────────────────────────────────────────
+class LoopMonitor:
+    """
+    [GEKTOR v16.0] Event Loop Starvation Monitor.
+    Measures event loop scheduling latency. If tasks block the loop for > 50ms,
+    triggers warning logs and alerts.
+    """
+    def __init__(self, warning_threshold_ms: float = 50.0):
+        self.threshold_sec = warning_threshold_ms / 1000.0
+        self.starvation_count = 0
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._is_running = False
+
+    async def start(self):
+        if self._is_running: return
+        self._is_running = True
+        self._monitor_task = asyncio.create_task(self._loop())
+        logger.info("🛡️ [AutoBugShield] Loop Starvation Monitor ACTIVE.")
+
+    async def stop(self):
+        self._is_running = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _loop(self):
+        while self._is_running:
+            start = time.monotonic()
+            await asyncio.sleep(0.01)  # Yield execution
+            elapsed = time.monotonic() - start - 0.01
+            if elapsed > self.threshold_sec:
+                self.starvation_count += 1
+                logger.critical(
+                    f"⚠️ [EVENT LOOP STARVATION] Task blocked the event loop for {elapsed*1000:.1f}ms! "
+                    f"Starvation Count: {self.starvation_count}"
+                )
+
+
+class MemoryShield:
+    """
+    [GEKTOR v16.0] Runtime Memory Guard.
+    Audits RAM usage. Force-triggers garbage collection if RSS exceeds limit.
+    """
+    def __init__(self, limit_mb: float = 1024.0):
+        self.limit_mb = limit_mb
+        self._is_running = False
+        self._monitor_task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        if self._is_running: return
+        self._is_running = True
+        self._monitor_task = asyncio.create_task(self._loop())
+        logger.info(f"🛡️ [AutoBugShield] Memory Shield ACTIVE (Limit: {self.limit_mb}MB).")
+
+    async def stop(self):
+        self._is_running = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _loop(self):
+        import gc
+        try:
+            import psutil
+            process = psutil.Process()
+        except ImportError:
+            process = None
+            logger.warning("psutil not available. Memory Shield operating in mock mode.")
+
+        while self._is_running:
+            await asyncio.sleep(5.0)
+            if process:
+                rss_mb = process.memory_info().rss / (1024 * 1024)
+                if rss_mb > self.limit_mb:
+                    logger.warning(
+                        f"🚨 [MEMORY OVERLIMIT] RAM usage {rss_mb:.1f}MB exceeds limit {self.limit_mb}MB. "
+                        "Executing force garbage collection."
+                    )
+                    gc.collect()
+
+
+class ComponentHealer:
+    """
+    [GEKTOR v16.0] Self-Correction & Recovery Engine.
+    Tracks failure rates for critical resources (BybitWS, Database, Redis).
+    Executes mitigation scripts if failures exceed safety thresholds.
+    """
+    def __init__(self, failure_limit: int = 5, window_sec: float = 10.0):
+        self.limit = failure_limit
+        self.window = window_sec
+        self._failures: Dict[str, List[float]] = {}
+        self._healing_locks: Set[str] = set()
+
+    def register_failure(self, component: str, recovery_callback=None) -> bool:
+        """
+        Record a failure for a component. If failure limit is breached,
+        runs recovery_callback (if provided and not already healing).
+        Returns True if healing was triggered.
+        """
+        now = time.monotonic()
+        if component not in self._failures:
+            self._failures[component] = []
+        
+        # Clean expired failures
+        self._failures[component] = [t for t in self._failures[component] if now - t <= self.window]
+        self._failures[component].append(now)
+
+        if len(self._failures[component]) >= self.limit:
+            if component not in self._healing_locks:
+                self._healing_locks.add(component)
+                logger.critical(
+                    f"💥 [SELF-HEALING] Component '{component}' breached safety threshold with "
+                    f"{len(self._failures[component])} failures in {self.window}s. Initiating recovery..."
+                )
+                if recovery_callback:
+                    asyncio.create_task(self._run_healing(component, recovery_callback))
+                return True
+        return False
+
+    async def _run_healing(self, component: str, callback):
+        try:
+            await callback()
+            logger.success(f"✅ [SELF-HEALING] Recovery completed successfully for component '{component}'.")
+        except Exception as e:
+            logger.error(f"❌ [SELF-HEALING] Recovery failed for component '{component}': {e}")
+        finally:
+            self._failures[component] = []
+            self._healing_locks.discard(component)
+
+
 class GlobalResilienceManager:
     """
     Эшелон 20: Единый Командный Центр.
-    Исправленная версия с поддержкой регистрации отказов и PTP Clock.
+    Исправленная версия с поддержкой регистрации отказов, PTP Clock, и AutoBug Shield.
     """
     _instance: Optional['GlobalResilienceManager'] = None
 
@@ -210,6 +348,11 @@ class GlobalResilienceManager:
         
         # Эшелон 21: Синхронизация времени
         self.ptp_clock = PTPClock()
+
+        # Echelon 22: Self-Healing & Diagnostics (AutoBug Shield)
+        self.loop_monitor = LoopMonitor()
+        self.memory_shield = MemoryShield()
+        self.healer = ComponentHealer()
         
         # Реестры для трекинга попыток и отказов
         self._failure_registry: Dict[str, int] = {} 
@@ -222,7 +365,17 @@ class GlobalResilienceManager:
         
         logger.info("🛡️ GEKTOR v13.7.1: GLOBAL RESILIENCE MANAGER INITIALIZED")
 
-    def register_failure(self, symbol: str):
+    async def start_shields(self):
+        """Start background loop and memory monitors."""
+        await self.loop_monitor.start()
+        await self.memory_shield.start()
+
+    async def stop_shields(self):
+        """Stop background loop and memory monitors."""
+        await self.loop_monitor.stop()
+        await self.memory_shield.stop()
+
+    def register_failure(self, symbol: str, recovery_callback=None):
         """
         Регистрирует сбой для символа или ресурса.
         """
@@ -231,6 +384,9 @@ class GlobalResilienceManager:
         
         if self._failure_registry[symbol] > 3:
             logger.warning(f"⚠️ [RESILIENCE] Extreme failure rate for {symbol} ({self._failure_registry[symbol]} attempts).")
+            
+        # Bind failure to ComponentHealer to trigger recovery scripts
+        self.healer.register_failure(symbol, recovery_callback)
 
     def register_success(self, symbol: str):
         """
