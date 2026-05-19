@@ -116,6 +116,11 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         "_ask_q",
         "_ask_n",
         "_delta_buffer",
+        "_survival_lut",
+        "_ask_ctr_fp",
+        "_ask_lambda_fp",
+        "_bid_ctr_fp",
+        "_bid_lambda_fp",
     )
 
     def __init__(self, symbol: str, *, max_levels: int = 8192, max_age_ms: float = 2500.0) -> None:
@@ -139,6 +144,75 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         self._delta_buffer = SHMDeltaRingBuffer()
         self._delta_buffer.head = 0
         self._delta_buffer.tail = 0
+
+        # Fixed-Point L2-LMPM structures
+        self._survival_lut = (ctypes.c_uint16 * 1024)()
+        self._ask_ctr_fp = (ctypes.c_uint16 * self._max_levels)()
+        self._ask_lambda_fp = (ctypes.c_uint16 * self._max_levels)()
+        self._bid_ctr_fp = (ctypes.c_uint16 * self._max_levels)()
+        self._bid_lambda_fp = (ctypes.c_uint16 * self._max_levels)()
+        self._precompute_lut(delta_t=1.2)
+
+    def _precompute_lut(self, delta_t: float = 1.2) -> None:
+        """Background precomputation of exp decay. Never called on the Hot Path."""
+        for i in range(1024):
+            real_prob = float(np.exp(-(i / 100.0) * delta_t))
+            self._survival_lut[i] = int(real_prob * 1024)
+
+    def update_pessimisation_parameters(self, delta_t: float) -> None:
+        """Background parameter update. Never called on the hot path."""
+        self._precompute_lut(delta_t=delta_t)
+
+    def recalculate_pessimisation_factors(
+        self,
+        alpha_0: float = 1.0,
+        beta: float = 0.5,
+        gamma: float = 10.0,
+    ) -> None:
+        """
+        Background calculation of CTR and Lambda fixed-point values.
+        Run every 10s or per macro-regime shift. Offloaded from hot path.
+        """
+        if not self._consistency_ok or self._ask_n == 0 or self._bid_n == 0:
+            return
+
+        best_bid = -int(self._bid_neg[0])
+        best_ask = int(self._ask_p[0])
+        mid_price = (best_bid + best_ask) / 2.0
+        if mid_price <= 0:
+            return
+
+        v_bid_0 = int(self._bid_q[0])
+        v_ask_0 = int(self._ask_q[0])
+        denom = v_bid_0 + v_ask_0
+        bbo_imbalance = (v_bid_0 - v_ask_0) / denom if denom > 0 else 0.0
+        sign_imbalance = np.sign(bbo_imbalance)
+
+        # Recalculate asks
+        for k in range(self._ask_n):
+            price = int(self._ask_p[k])
+            ctr = 0.3 * float(np.exp(-k / 10.0))
+            self._ask_ctr_fp[k] = int(ctr * 1024)
+
+            d_k = abs(price - mid_price) / mid_price
+            f_dk = 1.0 / (1.0 + gamma * d_k)
+            g_bbo = 1.0 + beta * sign_imbalance * 1.0
+            
+            lam = alpha_0 * f_dk * g_bbo
+            self._ask_lambda_fp[k] = min(1023, max(0, int(lam * 100.0)))
+
+        # Recalculate bids
+        for k in range(self._bid_n):
+            price = -int(self._bid_neg[k])
+            ctr = 0.3 * float(np.exp(-k / 10.0))
+            self._bid_ctr_fp[k] = int(ctr * 1024)
+
+            d_k = abs(price - mid_price) / mid_price
+            f_dk = 1.0 / (1.0 + gamma * d_k)
+            g_bbo = 1.0 + beta * sign_imbalance * (-1.0)
+
+            lam = alpha_0 * f_dk * g_bbo
+            self._bid_lambda_fp[k] = min(1023, max(0, int(lam * 100.0)))
 
     @property
     def symbol(self) -> str:
@@ -300,6 +374,9 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
             self._u = d_u
             if d_seq is not None:
                 self._last_seq = int(d_seq)
+        
+        # Обновляем факторы пессимизации при получении новой опорной точки стакана
+        self.recalculate_pessimisation_factors()
 
     def _fill_side_from_snapshot(
         self,
@@ -546,10 +623,21 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         idx = 0
         while idx < self._ask_n and remaining > 0:
             p = int(self._ask_p[idx])
-            q = int(self._ask_q[idx])
+            q_raw = int(self._ask_q[idx])
+            if q_raw <= 0:
+                idx += 1
+                continue
+
+            # Hot-Path L2-LMPM Fixed-Point Pessimisation (No allocations, no float math)
+            surviving_ctr_factor = 1024 - int(self._ask_ctr_fp[idx])
+            lut_idx = int(self._ask_lambda_fp[idx])
+            decay_factor = int(self._survival_lut[lut_idx])
+            q = (q_raw * surviving_ctr_factor * decay_factor) >> 20
+
             if q <= 0:
                 idx += 1
                 continue
+
             level_notional = (p * q) // SCALE
             fee = (level_notional * TAKER_FEE_NUMERATOR) // TAKER_FEE_DENOMINATOR
             pay = level_notional + fee
