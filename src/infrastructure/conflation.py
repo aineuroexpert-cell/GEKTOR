@@ -36,7 +36,7 @@ class DirectionalConflationBuffer:
             price = float(tick_dict['price'])
             vol = float(tick_dict['volume'])
             ts = int(tick_dict['timestamp'])
-            is_buy = tick_dict['side'].lower() == 'buy'
+            is_buy = str(tick_dict.get('side', '')).lower() == 'buy'
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"⚠️ [Conflation] Malformed tick: {e}")
             return

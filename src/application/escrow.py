@@ -1,7 +1,7 @@
 import asyncio
 import time
 import logging
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any, Set
 
 logger = logging.getLogger("GEKTOR.ESCROW")
 
@@ -10,7 +10,8 @@ class LiquidationEchoGuard:
     [ФАЗА 5: ИНВАЛИДАЦИЯ И ЭСКАЛАЦИЯ]
     Асинхронный Эскроу-буфер для защиты от запаздывающих ликвидаций.
     """
-    def __init__(self, escrow_window_ms: int = 150):
+    def __init__(self, event_bus: Any = None, escrow_window_ms: int = 150):
+        self.bus = event_bus
         self.escrow_window_sec = escrow_window_ms / 1000.0
         # Храним монотонное время последней ликвидации и её объем
         self._recent_liquidations: Dict[str, Tuple[float, str, float]] = {}
@@ -18,12 +19,24 @@ class LiquidationEchoGuard:
         
         # [MEMORY SAFETY] Реестр активных спящих задач
         self._pending_tasks: Dict[str, Set[asyncio.Task]] = {}
-        self._is_network_healthy = True
+        self._is_network_healthy: bool = True
+        self._health_last_updated: float = 0.0
 
-    def set_network_status(self, healthy: bool):
-        self._is_network_healthy = healthy
-        if not healthy:
+        if self.bus:
+            self.bus.subscribe("LiquidationEvent", self._handle_bus_liquidation)
+
+    def update_network_health(self, is_healthy: bool) -> None:
+        """Синхронный метод обновления стейта от HealthMonitor."""
+        self._is_network_healthy = is_healthy
+        if not is_healthy:
             self.purge_stale_escrow()
+
+    def _handle_bus_liquidation(self, event: dict):
+        self.register_liquidation_event(
+            event.get("symbol"), 
+            event.get("side"), 
+            event.get("usd_volume", 0.0)
+        )
 
     def register_liquidation_event(self, symbol: str, side: str, usd_volume: float):
         """Вызывается синхронно из WebSocket-ингестора ликвидаций"""

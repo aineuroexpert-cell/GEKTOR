@@ -1,4 +1,0 @@
-3 сценария для {direction} {symbol} entry={entry} stop={stop} tp1={tp1}:
-A: Импульс (win) B: Откат (partial) C: Отмена (loss).
-JSON: {{"scenario_a": "text", "scenario_b": "text", "scenario_c": "text"}}
-НЕ считать цены!

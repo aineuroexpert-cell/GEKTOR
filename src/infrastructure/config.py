@@ -1,62 +1,93 @@
-# src/infrastructure/config.py
-from pydantic import Field
+from typing import Any
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
-from loguru import logger
+
+from src.shared.alpha_config import alpha
+
 
 class Settings(BaseSettings):
-    # Telegram (Авто-маппинг через Alias)
-    TG_BOT_TOKEN: str = Field(alias="gerald_bot_token", default="")
-    TG_CHAT_ID: str = Field(alias="telegram_chat_id", default="")
-    
-    # Infrastructure (Redis Alias)
-    REDIS_HOST: str = Field(alias="redis_host", default="localhost")
-    REDIS_PORT: int = Field(alias="redis_port", default=6379)
-    REDIS_PASSWORD: Optional[str] = Field(alias="redis_password", default=None)
-    
-    # Database Alias
-    ASYNC_DATABASE_URL: str = Field(alias="async_database_url", default="")
-    
+    # Telegram
+    TG_BOT_TOKEN: str = Field(default="", alias="gerald_bot_token")
+    TG_CHAT_ID: str = Field(default="", alias="telegram_chat_id")
+
+    # Infrastructure
+    REDIS_HOST: str = Field(default="localhost", alias="redis_host")
+    REDIS_PORT: int = Field(default=6379, alias="redis_port")
+    REDIS_PASSWORD: str | None = Field(default=None, alias="redis_password")
+
+    # Database (critical, fail-fast)
+    ASYNC_DATABASE_URL: str = Field(..., alias="async_database_url")
+
     # Proxy
-    PROXY_URL: Optional[str] = Field(alias="proxy_url", default=None)
-    
-    # [GEKTOR APEX] MATH CALIBRATION (INTRADAY v4.1)
-    VPIN_WINDOW: int = 50
-    VPIN_THRESHOLD: float = 0.65 # Снижено до 0.65 для интрадей-чувствительности
+    PROXY_URL: str | None = Field(default=None, alias="proxy_url")
+    TG_PROXY_URL: str | None = Field(default=None, alias="tg_proxy_url")
+    TELEGRAM_PROXY: str | None = Field(default=None, alias="telegram_proxy")
+    USE_PROXY_FOR_BYBIT: bool = Field(default=False, alias="use_proxy_for_bybit")
+
+    # Bybit credentials (critical, fail-fast)
+    BYBIT_API_KEY: str = Field(..., alias="bybit_api_key")
+    BYBIT_API_SECRET: str = Field(..., alias="bybit_api_secret")
+    BYBIT_ACCOUNT_TYPE: str = "UNIFIED"
+
+    # [GEKTOR v5.22] Math calibration via AlphaConfig
+    VPIN_WINDOW: int = alpha.VPIN_WINDOW_SIZE
+    VPIN_THRESHOLD: float = alpha.VPIN_EXHAUSTION_THRESHOLD
     WARMUP_VOLUME: float = 5_000_000.0
-    
-    # [GEKTOR APEX] ADAPTIVE VOLUME CLOCKS (Target Vol per Symbol)
-    VOLUME_BUCKETS: dict = {
-        "BTCUSDT": 10_000_000.0,
-        "ETHUSDT": 3_000_000.0,
-        "DEFAULT": 1_000_000.0
-    }
 
-    # [GEKTOR APEX] EXIT PROTOCOL (PREMISE INVALIDATION)
-    EXIT_VPIN_DECAY_FACTOR: float = 0.4  # Сигнал выхода если VPIN упал ниже 40% от входа
-    EXIT_CUSUM_REVERSAL_SIGMA: float = 3.0 # Реверс потока в обратную сторону
-    EXIT_TIME_MAX_BARS: int = 24  # Максимум 24 адаптивных бара (~2 часа при баре 5 мин)
+    # [GEKTOR v5.22] Adaptive Volume Clocks
+    VOLUME_BUCKETS: dict[str, float] = alpha.VOLUME_CLOCKS if alpha.VOLUME_CLOCKS else {"DEFAULT": 1_000_000.0}
 
-    # [GEKTOR APEX] MICROSTRUCTURE CALIBRATION (INTRADAY v4.1)
-    # Пороги смещены для захвата внутридневных институциональных импульсов
-    MICRO_OFI_CONFIG: dict = {
-        "MAJORS": {"threshold": 1500.0, "factor": 0.33}, # BTC/ETH
-        "ALTS": {"threshold": 500.0, "factor": 0.4}      # SOL, XRP, RAVE
-    }
-    
+    # [GEKTOR v5.22] Exit Protocol
+    EXIT_VPIN_DECAY_FACTOR: float = alpha.EXIT_VPIN_DECAY_FACTOR
+    EXIT_CUSUM_REVERSAL_SIGMA: float = alpha.EXIT_CUSUM_REVERSAL_SIGMA
+    EXIT_TIME_MAX_BARS: int = alpha.EXIT_TIME_MAX_BARS
+
+    # [GEKTOR v5.24] Resilience Anchors
+    SNAPSHOT_TIMEOUT_SEC: float = 15.0
+    CAUSAL_TIMEOUT_MS: int = 500
+
+    # [GEKTOR v5.22] Microstructure Calibration
+    MICRO_OFI_CONFIG: dict[str, Any] = alpha.MICRO_OFI if alpha.MICRO_OFI else {}
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",
         case_sensitive=False,
-        populate_by_name=True
+        populate_by_name=True,
     )
 
+    @model_validator(mode="after")
+    def _validate_critical_runtime_vars(self) -> "Settings":
+        missing: list[str] = []
+
+        if not self.ASYNC_DATABASE_URL.strip():
+            missing.append("async_database_url")
+        if not self.BYBIT_API_KEY.strip():
+            missing.append("bybit_api_key")
+        if not self.BYBIT_API_SECRET.strip():
+            missing.append("bybit_api_secret")
+
+        if missing:
+            required = ", ".join(missing)
+            raise ValueError(
+                f"Critical runtime configuration is missing or empty: {required}. "
+                "Set required variables in environment or .env before startup."
+            )
+
+        return self
+
     @property
-    def bot_token(self) -> str: return self.TG_BOT_TOKEN
+    def bot_token(self) -> str:
+        return self.TG_BOT_TOKEN.strip() if self.TG_BOT_TOKEN else ""
+
     @property
-    def chat_id(self) -> str: return self.TG_CHAT_ID
+    def chat_id(self) -> str:
+        return self.TG_CHAT_ID.strip() if self.TG_CHAT_ID else ""
+
     @property
-    def VPIN_BUCKET_VOLUME(self) -> float: 
+    def VPIN_BUCKET_VOLUME(self) -> float:
         return self.VOLUME_BUCKETS.get("DEFAULT", 1_000_000.0)
+
 
 settings = Settings()

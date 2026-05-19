@@ -1,1 +1,0 @@
-# DEACTIVATED - Operation CLEAN MONOLITH

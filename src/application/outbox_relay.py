@@ -1,9 +1,9 @@
 import asyncio
 import logging
 import json
-from typing import List, Optional
+from typing import List, Optional, Protocol, Any
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 
 logger = logging.getLogger("GEKTOR.Outbox")
@@ -12,6 +12,7 @@ logger = logging.getLogger("GEKTOR.Outbox")
 class OutboxMessage:
     id: int
     payload: str
+    priority: int
     status: str
     created_at: datetime
     execute_after: datetime
@@ -21,6 +22,15 @@ class RetryableError(Exception):
     def __init__(self, retry_after: int):
         self.retry_after = retry_after
         super().__init__(f"Rate limit exceeded. Retry after {retry_after}s.")
+
+
+class INotifier(Protocol):
+    async def notify(self, payload: dict[str, Any]) -> bool:
+        ...
+
+    @property
+    def last_retry_after_sec(self) -> int:
+        ...
 
 class OutboxRepository:
     """[GEKTOR v2.0] Абстракция Transactional Outbox для атомарной записи."""
@@ -45,10 +55,10 @@ class OutboxRepository:
     async def fetch_pending(self, batch_size: int = 10) -> List[OutboxMessage]:
         """Чтение с блокировкой для эксклюзивного захвата (FOR UPDATE SKIP LOCKED). Транзакция короткая! (микросекунды)"""
         query = """
-            SELECT id, payload, status, created_at, execute_after, retry_count 
+            SELECT id, payload, priority, status, created_at, execute_after, retry_count 
             FROM outbox_events 
             WHERE status = 'PENDING' AND execute_after <= :now
-            ORDER BY execute_after ASC 
+            ORDER BY priority ASC, created_at ASC
             LIMIT :limit 
             FOR UPDATE SKIP LOCKED
         """
@@ -62,10 +72,11 @@ class OutboxRepository:
                 messages.append(OutboxMessage(
                     id=r[0],
                     payload=r[1],
-                    status=r[2],
-                    created_at=r[3],
-                    execute_after=r[4],
-                    retry_count=r[5]
+                    priority=r[2],
+                    status=r[3],
+                    created_at=r[4],
+                    execute_after=r[5],
+                    retry_count=r[6]
                 ))
             
             # Since we locked them, let's mark their retry count preemptively or just return 
@@ -103,7 +114,7 @@ class OutboxRepository:
 
 class TelegramRelayWorker:
     """[GEKTOR v2.0] Изолированный демон Relay. Никакого сетевого блокирования Ядра."""
-    def __init__(self, repo: OutboxRepository, tg_client):
+    def __init__(self, repo: OutboxRepository, tg_client: INotifier):
         self.repo = repo
         self.tg = tg_client
         self._running = False
@@ -120,15 +131,32 @@ class TelegramRelayWorker:
             
             for msg in messages:
                 try:
-                    await self.tg.send_message(msg.payload)
-                    await self.repo.mark_delivered(msg.id)    # Phase 3a: Delete
-                except RetryableError as e:  # HTTP 429
-                    logger.warning(f"⏳ [RELAY] HTTP 429. Deferring msg {msg.id} by {e.retry_after}s.")
-                    await self.repo.mark_failed_for_retry(msg.id, delay_sec=e.retry_after)  # Phase 3b: Defer
+                    payload = self._decode_payload(msg.payload)
+                    sent = await self.tg.notify(payload)
+                    if sent:
+                        await self.repo.mark_delivered(msg.id)
+                    else:
+                        delay_sec = max(1, int(getattr(self.tg, "last_retry_after_sec", 5)))
+                        logger.warning(f"⏳ [RELAY] Notify deferred for msg {msg.id} by {delay_sec}s.")
+                        await self.repo.mark_failed_for_retry(msg.id, delay_sec=delay_sec)
                 except Exception as e:
                     logger.error(f"☠️ [RELAY] Fatal delivery error: {e}")
                     # Вернуть в PENDING для базового ретрая
                     await self.repo.mark_failed_for_retry(msg.id, delay_sec=30)
+
+    @staticmethod
+    def _decode_payload(raw_payload: str) -> dict[str, Any]:
+        """
+        Outbox stores either JSON payloads or preformatted strings.
+        For legacy plain text, wrap into a raw text payload.
+        """
+        try:
+            parsed = json.loads(raw_payload)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        return {"event_type": "RAW_TEXT", "symbol": "GLOBAL", "reason": "", "fact": raw_payload, "limit": ""}
 
     def stop(self):
         self._running = False

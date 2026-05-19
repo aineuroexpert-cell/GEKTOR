@@ -1,7 +1,0 @@
-ERROR: Invalid config at C:\Users\Пользователь\.openclaw\openclaw.json:\n- memory: Unrecognized keys: "provider", "model"
-Config invalid
-File: ~\.openclaw\openclaw.json
-Problem:
-  - memory: Unrecognized keys: "provider", "model"
-
-Run: openclaw doctor --fix

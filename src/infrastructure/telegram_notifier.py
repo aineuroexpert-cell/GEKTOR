@@ -11,8 +11,29 @@ from datetime import datetime, timezone
 from aiohttp_socks import ProxyConnector
 from loguru import logger
 from typing import Any, Optional
+from src.application.formatters import TelegramMessageFormatter
+from src.infrastructure.config import settings
 from src.infrastructure.database import DatabaseManager
 from src.domain.entities.events import ExecutionEvent, ConflatedEvent
+
+class AlertDebouncer:
+    """[GEKTOR v5.24] O(1) Spam Suppression for Infrastructure Alerts."""
+    __slots__ = ('_cooldown_seconds', '_last_alert_time')
+
+    def __init__(self, cooldown_seconds: int = 300):
+        self._cooldown_seconds = cooldown_seconds
+        self._last_alert_time: dict[str, float] = {}
+
+    def should_notify(self, alert_signature: str) -> bool:
+        """Determines if enough time has passed to re-send a similar alert."""
+        now = time.time()
+        last_time = self._last_alert_time.get(alert_signature, 0.0)
+        
+        if (now - last_time) < self._cooldown_seconds:
+            return False
+            
+        self._last_alert_time[alert_signature] = now
+        return True
 
 class TelegramRadarNotifier:
     """[GEKTOR v2.0] Institutional Telegram Client with PSR Protocol & Self-Healing Bridge."""
@@ -20,9 +41,11 @@ class TelegramRadarNotifier:
         self.db = db_manager
         self.bot_token = bot_token
         self.chat_id = chat_id
-        self.proxy_url = proxy_url
+        self.proxy_url = proxy_url or settings.TELEGRAM_PROXY
         self.bus = event_bus
         self.api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        
+        logger.info(f"🔑 [Telegram] Token loaded: {bool(self.bot_token)}, Chat ID loaded: {bool(self.chat_id)}")
         
         # [PSR 4.0] TRANSACTIONAL OUTBOX (Persistence > Speed)
         self._wakeup_event = asyncio.Event()
@@ -38,7 +61,13 @@ class TelegramRadarNotifier:
         self.fallback_file = "failed_alerts.jsonl"
         self._running = False
         self._session: Optional[aiohttp.ClientSession] = None
+        # [GEKTOR v5.24] ZERO-BLOCKING EGRESS
+        self._queue = asyncio.Queue(maxsize=100)
+        self.debouncer = AlertDebouncer(cooldown_seconds=300)
         self._worker_task: Optional[asyncio.Task] = None
+        self._running = False
+        self.formatter = TelegramMessageFormatter()
+        self._last_retry_after_sec = 5
 
     def _generate_event_id(self, event_data: dict) -> str:
         raw = f"{event_data.get('symbol')}_{event_data.get('timestamp')}_{event_data.get('price')}"
@@ -50,94 +79,132 @@ class TelegramRadarNotifier:
         logger.info("📡 [Telegram] Secure tunnel initialized. PSR Protocol ARMED.")
 
     async def _process_worker(self):
-        """[PSR 4.1] NECROMANCER: Immortal Egress Worker with Self-Healing Bridge."""
-        if self.proxy_url:
-            masked_proxy = self.proxy_url.split('@')[-1] if '@' in self.proxy_url else self.proxy_url
-            logger.info(f"📡 [Telegram] Worker process started using proxy: {masked_proxy}")
-        else:
-            logger.warning("📡 [Telegram] Worker process started WITHOUT proxy (Direct connection).")
+        """[GEKTOR v5.25] Nuclear-Isolated Egress. No network exception escapes."""
+        import aiohttp
+        from aiohttp_socks import ProxyConnector
 
-        backoff_sec = 1.0
-        
-        # [OUTER LOOP: IMMORTAL NECROMANCER]
-        # This loop NEVER exits while self._running is True.
-        # If the inner session dies (VPN crash, proxy timeout, aiohttp explosion),
-        # we catch the corpse, sleep with exponential backoff, and resurrect.
         while self._running:
-            session = None
+            # --- SESSION CREATION (with proxy fallback) ---
+            client_timeout = aiohttp.ClientTimeout(total=3.0, connect=2.0)
             try:
-                connector = ProxyConnector.from_url(self.proxy_url) if self.proxy_url else None
-                timeout = aiohttp.ClientTimeout(total=20)
-                session = aiohttp.ClientSession(connector=connector, timeout=timeout)
-                self._session = session
-                
-                # [BRIDGE RECOVERY] If we're coming back from the dead, announce it
-                if not self.is_bridge_alive:
-                    logger.success("🌉 [BRIDGE RECOVERED] Телеграм-мост восстановлен.")
-                self.is_bridge_alive = True
-                backoff_sec = 1.0  # Reset penalty on successful connection
-                
-                logger.debug("📡 [Telegram] Session active. Running recovery...")
-                await self._run_recovery_phase()
-                
-                # [INNER LOOP: HOT DISPATCH]
-                while self._running:
-                    try:
-                        await asyncio.wait_for(self._wakeup_event.wait(), timeout=10.0)
-                        self._wakeup_event.clear()
-                    except asyncio.TimeoutError:
-                        pass 
-                    
-                    await self._live_allowed.wait()
-                    
-                    if self._is_throttled:
-                        await asyncio.sleep(5)
-                        continue
-                        
-                    # Fetch PENDING alerts
-                    async with self.db.engine.connect() as conn:
-                        result = await conn.execute(text(
-                            "SELECT id, message, priority FROM outbox "
-                            "WHERE status = 'PENDING' "
-                            "ORDER BY priority ASC, created_at ASC LIMIT 10"
-                        ))
-                        pending_alerts = result.all()
+                if self.proxy_url:
+                    logger.info(f"🌐 [Telegram] Egress routed via Proxy: {self.proxy_url[:32]}...")
+                async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                    self._session = session
+                    while self._running:
+                        alert_type = "UNKNOWN"
+                        try:
+                            text, alert_type = await self._queue.get()
 
-                    if pending_alerts:
-                        logger.debug(f"📡 [Telegram] Found {len(pending_alerts)} pending alerts.")
-                        for alert_id, message, priority in pending_alerts:
-                            logger.info(f"📡 [Telegram] Attempting delivery of alert {alert_id} (Priority {priority})...")
-                            success = await self._send_with_retry(message, {"id": alert_id})
-                            if success:
-                                await self.db.push_query(
-                                    "UPDATE outbox SET status = 'SENT' WHERE id = :id",
-                                    {"id": alert_id}
-                                )
-                                logger.success(f"✅ [Telegram] Alert {alert_id} DELIVERED.")
-                                await asyncio.sleep(0.3)
-                            else:
-                                logger.error(f"❌ [Telegram] Alert {alert_id} DELIVERY FAILED.")
-                                if self._is_throttled:
-                                     break
-                    
-                    await asyncio.sleep(1.0)
-                    
+                            if not self.debouncer.should_notify(alert_type):
+                                self._queue.task_done()
+                                continue
+
+                            payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
+                            try:
+                                async with asyncio.timeout(3.0):
+                                    async with session.post(self.api_url, json=payload, proxy=self.proxy_url) as resp:
+                                        if resp.status != 200:
+                                            err_body = await resp.text()
+                                            logger.error(f"⚠️ [TG_API] Dispatch Error {resp.status}: {err_body}")
+                                        else:
+                                            logger.success(f"📱 [Telegram] Alert delivered: {alert_type}")
+                            except (TimeoutError, asyncio.TimeoutError):
+                                logger.warning(f"⏰ [TG_WORKER] Timeout (3s). Dropping: {alert_type}")
+                            except (ConnectionRefusedError, ConnectionResetError, OSError) as e:
+                                logger.warning(f"🔌 [TG_WORKER] Network refused: {e}. Dropping: {alert_type}")
+                            except aiohttp.ClientProxyConnectionError as e:
+                                self._last_retry_after_sec = 5
+                                logger.warning(f"🌐 [TG_WORKER] Proxy unavailable: {e}. Requeue in 5s: {alert_type}")
+                                try:
+                                    self._queue.put_nowait((text, alert_type))
+                                except asyncio.QueueFull:
+                                    logger.error("🛑 [TG_DRAIN] Queue overflow while requeueing proxy-failed packet.")
+                                await asyncio.sleep(5)
+                            except Exception as e:
+                                # Catch ProxyConnectionError and any aiohttp transport errors
+                                logger.error(f"🚨 [Telegram] Alert failed! Exception: {repr(e)}")
+
+                            self._queue.task_done()
+                            await asyncio.sleep(0.3)
+
+                        except asyncio.CancelledError:
+                            return
+                        except Exception as e:
+                            logger.error(f"💥 [TG_WORKER] Inner loop error: {type(e).__name__}: {e}")
+                            try: self._queue.task_done()
+                            except ValueError: pass
+                            await asyncio.sleep(2.0)
+
             except asyncio.CancelledError:
-                logger.warning("🔌 [Telegram] Worker cancelled. Exiting gracefully.")
-                break
+                return
             except Exception as e:
-                # [BRIDGE DEAD] Session exploded. VPN disconnect, proxy failure, etc.
-                self.is_bridge_alive = False
-                self._session = None
-                logger.critical(f"🚨 [!!! BRIDGE DEAD !!!] ТЕЛЕГРАМ-МОСТ УНИЧТОЖЕН: {e}")
-                logger.warning(f"🔄 [BRIDGE REBOOT] Попытка воскрешения через {backoff_sec:.0f}с...")
-                await asyncio.sleep(backoff_sec)
-                backoff_sec = min(backoff_sec * 2, 60.0)  # Cap at 60 seconds
-            finally:
-                if session and not session.closed:
-                    await session.close()
-        
-        logger.warning("🔌 [Telegram] Worker stopped.")
+                # Session creation itself failed (dead proxy, DNS, etc.)
+                logger.error(f"🛑 [TG_WORKER] Session creation failed: {type(e).__name__}: {e}. Retrying in 10s...")
+                await asyncio.sleep(10.0)
+
+    async def notify_manual(self, text: str, alert_type: str = "DEFAULT"):
+        """[PSR 4.1] Instant System Alert. Returns coroutine for create_task compatibility."""
+        try:
+            # We still use put_nowait to avoid blocking the caller, but the method is now async
+            self._queue.put_nowait((text, alert_type))
+        except asyncio.QueueFull:
+            logger.error("🛑 [TG_DRAIN] Alert Queue Overload! Dropping packet.")
+        except Exception as e:
+            logger.error(f"TG Error: {e}")
+
+    @property
+    def last_retry_after_sec(self) -> int:
+        return self._last_retry_after_sec
+
+    async def notify(self, payload: dict[str, Any]) -> bool:
+        """Protocol-compatible notifier entrypoint for Outbox relay."""
+        message = self.formatter.format(payload)
+        return await self._send_text_with_retry(message)
+
+    async def _send_text_with_retry(self, message: str) -> bool:
+        """Sends one HTML message with retry semantics and 429 backoff."""
+        body = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
+        timeout = aiohttp.ClientTimeout(total=5.0, connect=3.0)
+
+        for attempt in range(3):
+            try:
+                if self._session and not self._session.closed:
+                    async with self._session.post(self.api_url, json=body, proxy=self.proxy_url) as resp:
+                        if resp.status == 429:
+                            retry_after = int(resp.headers.get("Retry-After", 5))
+                            self._last_retry_after_sec = retry_after
+                            logger.warning(f"🚨 [TG_API] 429 Too Many Requests. retry_after={retry_after}s")
+                            await asyncio.sleep(retry_after)
+                            return False
+                        if resp.status != 200:
+                            logger.error(f"⚠️ [TG_API] Dispatch Error {resp.status}: {await resp.text()}")
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        return True
+
+                async with aiohttp.ClientSession(timeout=timeout) as temp_session:
+                    async with temp_session.post(self.api_url, json=body, proxy=self.proxy_url) as resp:
+                        if resp.status == 429:
+                            retry_after = int(resp.headers.get("Retry-After", 5))
+                            self._last_retry_after_sec = retry_after
+                            logger.warning(f"🚨 [TG_API] 429 Too Many Requests. retry_after={retry_after}s")
+                            await asyncio.sleep(retry_after)
+                            return False
+                        if resp.status != 200:
+                            logger.error(f"⚠️ [TG_API] Dispatch Error {resp.status}: {await resp.text()}")
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        return True
+            except aiohttp.ClientProxyConnectionError as e:
+                self._last_retry_after_sec = 5
+                logger.warning(f"🌐 [TG_API] Proxy connection failed: {e}. retry_after=5s")
+                await asyncio.sleep(self._last_retry_after_sec)
+                return False
+            except Exception as e:
+                logger.error(f"🚨 [Telegram] Alert failed! Exception: {repr(e)}")
+                await asyncio.sleep(2 ** attempt)
+        return False
 
     async def _run_recovery_phase(self):
         if not os.path.exists(self.fallback_file) or os.path.getsize(self.fallback_file) == 0:
@@ -188,13 +255,15 @@ class TelegramRadarNotifier:
                         retry_after = int(resp.headers.get("Retry-After", 5))
                         logger.warning(f"🚨 [Telegram] Rate Limit! Backing off for {retry_after}s.")
                         await asyncio.sleep(retry_after)
-                        return False # Worker will retry later
-                    resp.raise_for_status()
+                    if resp.status != 200:
+                        logger.error(f"🚨 [Telegram] API Error {resp.status}: {await resp.text()}")
+                        await asyncio.sleep(2 ** attempt)
+                        continue
                     self._is_throttled = False
                     logger.success("📱 [Telegram] Отчет доставлен.")
                     return True
             except Exception as e:
-                logger.debug(f"⚠️ [Telegram] Retry {attempt+1} failed: {e}")
+                logger.error(f"🚨 [Telegram] Alert failed! Exception: {repr(e)}")
                 await asyncio.sleep(2 ** attempt)
 
         if not is_recovery:
@@ -208,63 +277,64 @@ class TelegramRadarNotifier:
 
     def notify_event(self, event_data: dict):
         """[PSR 4.0] Transactional Atomic Alerting."""
-        priority = 2 # Normal Entry
-        if event_data.get("abort_mission"):
-            priority = 1 # High Priority Exit
+        payload = dict(event_data)
+        payload.setdefault("event_type", "APPROVED")
+        event_type = str(payload.get("event_type", "APPROVED")).upper()
+
+        if event_type in {"APPROVED", "ABORT"} or payload.get("abort_mission"):
+            priority = 1
+        elif event_type in {"REJECTED", "HEARTBEAT"}:
+            priority = 10
+        else:
+            priority = 2
         
-        message = self._format_message(event_data)
-        
+        # [GEKTOR v5.24] SPAM SUPPRESSION
+        alert_type = f"EVENT_{event_data.get('symbol', 'GLOBAL')}"
+        if not self.debouncer.should_notify(alert_type):
+            return
+            
         # Write to Outbox (Atomic Disk Persistence)
         if self.bus:
             self.bus.publish_fire_and_forget(self.db.push_query(
-                "INSERT INTO outbox (message, priority, status) VALUES (:msg, :pri, 'PENDING')",
-                {"msg": message, "pri": priority}
+                "INSERT INTO outbox_events (payload, priority, status) VALUES (:msg, :pri, 'PENDING')",
+                {"msg": json.dumps(payload, ensure_ascii=False, default=str), "pri": priority}
             ))
         else:
             asyncio.create_task(self.db.push_query(
-                "INSERT INTO outbox (message, priority, status) VALUES (:msg, :pri, 'PENDING')",
-                {"msg": message, "pri": priority}
+                "INSERT INTO outbox_events (payload, priority, status) VALUES (:msg, :pri, 'PENDING')",
+                {"msg": json.dumps(payload, ensure_ascii=False, default=str), "pri": priority}
             ))
         self._wakeup_event.set()
 
     async def handle_execution_event(self, event: ExecutionEvent):
         """[EventBus Handler] Converts ExecutionEvent to Telegram notification."""
         data = event.to_dict()
-        # Add metadata fields to top level for _format_message
         data.update(event.metadata)
         self.notify_event(data)
 
     async def handle_conflated_event(self, event: ConflatedEvent):
         """[EventBus Handler] Converts ConflatedEvent to Telegram notification."""
-        logger.warning(f"🛡️ [Telegram] Processing CONFLATED signal for {event.symbol} ({event.tick_count} items).")
         data = event.to_dict()
         data["is_conflated"] = True
         self.notify_event(data)
-
-    async def notify_manual(self, text: str):
-        """[PSR 4.0] Transactional System Alert. Async awaitable."""
-        logger.critical(f"🔔 [ALERT] Queueing manual notification: {text}")
-        try:
-            await self.db.push_query(
-                "INSERT INTO outbox (message, priority, status) VALUES (:msg, 1, 'PENDING')",
-                {"msg": text}
-            )
-            self._wakeup_event.set()
-        except Exception as e:
-            logger.error(f"Failed to queue manual alert: {e}")
 
     async def broadcast_offline_sync(self, reason: str) -> None:
         """
         Предсмертный крик. Вызывается из GlobalDeadMansSwitch.
         ОБЯЗАН быть await, никаких fire_and_forget.
         """
-        logger.warning(f"🔌 [Telegram] Queueing terminal notification: {reason}")
-        payload = f"🔌 [ОФФЛАЙН] Система завершает работу. Причина: {reason}"
+        sig_map = {
+            "SIGINT": "Прерывание (Ctrl+C)",
+            "SIGTERM": "Команда завершения (Terminate)",
+            "SIGABRT": "Аварийный сбой (Abort)"
+        }
+        friendly_reason = sig_map.get(reason, reason)
+        payload = f"🔌 [ОФФЛАЙН] Система завершает работу. Причина: {friendly_reason}"
         
         # Строгое ожидание записи в БД. Транзакция должна завершиться до остановки Loop'а.
         try:
             await self.db.push_query(
-                "INSERT INTO outbox (message, priority, status) VALUES (:msg, 1, 'PENDING')",
+                "INSERT INTO outbox_events (payload, priority, status) VALUES (:msg, 1, 'PENDING')",
                 {"msg": payload}
             )
             self._wakeup_event.set()
@@ -282,11 +352,15 @@ class TelegramRadarNotifier:
 
         payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
         try:
-            async with self._session.post(self.api_url, json=payload) as resp:
-                resp.raise_for_status()
+            async with self._session.post(self.api_url, json=payload, proxy=self.proxy_url) as resp:
+                if resp.status != 200:
+                    logger.error(f"🚨 [Telegram] API Error {resp.status}: {await resp.text()}")
+                    return
                 logger.success("🔔 [Telegram] Manual alert sent.")
+        except aiohttp.ClientProxyConnectionError as e:
+            logger.warning(f"🌐 [Telegram] Proxy connection failed (manual alert): {e}")
         except Exception as e:
-            logger.error(f"❌ [Telegram] Manual alert failed: {e}")
+            logger.error(f"🚨 [Telegram] Alert failed! Exception: {repr(e)}")
 
     def _format_message(self, event: dict, is_delayed: bool = False) -> str:
         """[GEKTOR v2.0] Профессиональный формат торговых алертов (Локализация: RU)."""

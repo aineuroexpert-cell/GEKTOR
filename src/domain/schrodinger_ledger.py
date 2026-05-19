@@ -41,6 +41,37 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum, auto
+import ctypes
+import zlib
+import mmap
+import os
+
+LEDGER_SIZE: int = 1024 * 1024  # 1MB Memory Map
+
+class OrderRecord(ctypes.Structure):
+    """
+    Zero-Copy representation of an order in shared memory.
+    Protects against Torn Writes during hard power loss.
+    """
+    _pack_ = 1  # Disable alignment for exact sizing
+    _fields_ = [
+        ("order_id", ctypes.c_uint64),
+        ("status", ctypes.c_uint8),  # 0: PENDING, 1: FILLED, 2: INDETERMINATE
+        ("scaled_volume", ctypes.c_uint64),
+        ("crc32", ctypes.c_uint32)   # Cryptographic seal
+    ]
+
+    def compute_crc(self) -> int:
+        # Compute CRC32 of payload, excluding the last 4 bytes (the crc32 field itself)
+        payload = bytes(self)[:-4]
+        return zlib.crc32(payload) & 0xFFFFFFFF
+
+    def commit(self) -> None:
+        # Strict write: payload first, then checksum
+        self.crc32 = self.compute_crc()
+
+    def is_valid(self) -> bool:
+        return self.crc32 == self.compute_crc()
 
 
 # ═══════════════════════════════════════════════════════════════════

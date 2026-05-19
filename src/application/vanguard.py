@@ -17,7 +17,7 @@ class VanguardScanner:
         self._lock = asyncio.Lock()
         self._running = False
 
-    async def scan_market_cycle(self):
+    async def start(self):
         """
         Background task to rebalance the trading universe.
         [Lifecycle] Runs every 15 minutes.
@@ -39,6 +39,10 @@ class VanguardScanner:
                 logger.error(f"⚠️ [Vanguard] Periodic scan failed: {e}")
             
             await asyncio.sleep(900)
+
+    async def scan_market_cycle(self):
+        """Backward-compatible alias for legacy callers."""
+        await self.start()
 
     def _filter_top_liquidity(self, tickers: List[Dict]) -> Set[str]:
         """Filters assets with sufficient liquidity for VPIN stability."""

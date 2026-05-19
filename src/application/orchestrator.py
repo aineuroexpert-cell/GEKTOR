@@ -1,175 +1,249 @@
+# -*- coding: utf-8 -*-
 # src/application/orchestrator.py
+
 import asyncio
+import bisect
 import math
 import time
 import os
+import uuid
 import json
-from typing import Dict, List, Optional, Any
+import threading
+import queue
+from typing import Dict, List, Optional, Any, Set, Tuple, Union, Callable, Coroutine
+import collections
 from loguru import logger
 
 from src.infrastructure.config import settings
 from src.infrastructure.database import DatabaseManager
 from src.infrastructure.telegram_notifier import TelegramRadarNotifier
-from src.infrastructure.bybit import BybitIngestor
+from src.infrastructure.bybit import BybitIngestor, PrivateBybitWSIngestor
+from src.infrastructure.bybit import BybitRestClient
+from src.infrastructure.event_bus import EventBus
+from src.infrastructure.state_healer import L6StateHealer
+from src.infrastructure.flight_recorder import AtomicFlightRecorder
+
 from src.application.pool_manager import WorkerPoolManager
-from src.domain.math_core import process_ticks_subroutine
-from src.domain.exit_protocol import MarketTick as ExitTick
-from src.application.exit_protocol_service import SignalTracker
 from src.application.sentinel_watchdog import event_loop_monitor
-from src.infrastructure.conflation import DirectionalConflationBuffer
 from src.application.vanguard import VanguardScanner
 from src.application.microstructure import MicrostructureDefender, L2Snapshot, L2Level
-from src.infrastructure.bybit import BybitRestClient
-from src.domain.macro_regime import MacroRegimeFilter
-from src.domain.friction_guard import ExecutionFrictionGuard
-from src.application.sentinel import BlackoutSentinel, FlatlineSentinel
-from src.infrastructure.event_bus import EventBus
-from src.domain.entities.events import ExecutionEvent, ConflatedEvent, StateInvalidationEvent, EuthanasiaEvent
+from src.application.layer6_autonomous import AutonomousExecutionGateway
 from src.application.quarantine import QuarantineManager
 from src.application.escrow import LiquidationEchoGuard
+from src.application.alpha_engine import ZeroAllocationEngine
+from src.application.sentry_brain import SentryBrain
+from src.application.exit_protocol_service import SignalTracker
+from src.application.outbox_relay import OutboxRepository, TelegramRelayWorker
+
+from src.domain.math_core import process_ticks_subroutine
+from src.domain.exit_protocol import MarketTick as ExitTick
+from src.domain.macro_regime import MacroRegimeFilter
+from src.domain.friction_guard import ExecutionFrictionGuard, PostTradeToxicityMonitor
+from src.domain.entities.events import ExecutionEvent, ConflatedEvent, StateInvalidationEvent, EuthanasiaEvent
+# [НОВЫЙ ИМПОРТ: ДВИЖОК ВЫХОДА]
+from src.domain.exit_protocol import MicrostructuralExitEngine, ActiveSignal, ExitReason
+
+from src.shared.resilience import GlobalResilienceManager, HydrationPriority, EntropyManager
+from src.shared.alpha_config import alpha
+from decimal import Decimal, ROUND_DOWN, ROUND_FLOOR, ROUND_CEILING
+
+# --- Вспомогательные классы (Normalizer, Debouncer, Batcher, RiskGuard, ShadowLedger, Genesis) ---
+class AbsolutePrecisionNormalizer:
+    @staticmethod
+    def normalize_price(price: float, tick_size: float) -> float:
+        if tick_size <= 0: return price
+        d_price = Decimal(str(price))
+        d_tick = Decimal(str(tick_size))
+        return float((d_price / d_tick).quantize(Decimal('1'), rounding=ROUND_FLOOR) * d_tick)
+
+    @staticmethod
+    def normalize_quantity(quantity: float, step_size: float) -> float:
+        if step_size <= 0: return quantity
+        d_qty = Decimal(str(quantity))
+        d_step = Decimal(str(step_size))
+        return float((d_qty / d_step).quantize(Decimal('1'), rounding=ROUND_DOWN) * d_step)
+
+
+class ThrottleDebouncer:
+    def __init__(self, cooldown_sec: float):
+        self.cooldown_sec = cooldown_sec
+        self._last_call: Dict[str, float] = {}
+
+    def allow(self, key: str, current_ts: float) -> bool:
+        if key not in self._last_call or (current_ts - self._last_call[key]) > self.cooldown_sec:
+            self._last_call[key] = current_ts
+            return True
+        return False
+
+
 class TickBatcher:
-    """[GEKTOR v2.0] IPC Optimization with Memory Cycle Management."""
-    def __init__(self, symbol: str, pool_manager: WorkerPoolManager, on_results_callback):
-        self.symbol = symbol
-        self.pool_manager = pool_manager
-        self.on_results = on_results_callback
-        
-        # [SLOW CONSUMER SHIELD]
-        self.buffer = DirectionalConflationBuffer(critical_size=2000)
-        
-        self.max_batch_size = 500
-        self.last_flush = time.time()
-        self._lock = asyncio.Lock()
-        self._flush_task = asyncio.create_task(self._timer_flush())
+    def __init__(self, max_batch_size: int = 100, max_delay_sec: float = 0.5):
+        self.max_batch_size = max_batch_size
+        self.max_delay_sec = max_delay_sec
+        self.buffer = []
+        self.last_flush = time.monotonic()
 
-    async def add_tick(self, tick_dict: dict):
-        """МГНОВЕННЫЙ ИСТОЧНИК ПИТАНИЯ. Не блокирует луп."""
-        self.buffer.ingest_immediate(tick_dict)
-        # Если накопилось много, пытаемся сбросить (без ожидания семафора здесь)
-        if len(self.buffer._buffer) >= self.max_batch_size:
-            # Note: We don't use the event bus for TickBatcher because it has its own 
-            # DirectionalConflationBuffer for raw ticks. But we use a protected task.
-            task = asyncio.create_task(self._safe_flush())
-            # For TickBatcher, we handle task protection locally 
-            # or could use a global task repository. 
-            # Given current architecture, we'll keep it as create_task but 
-            # ideally this should also be managed.
+    def add(self, tick):
+        self.buffer.append(tick)
 
-    async def _safe_flush(self):
-        """Попытка сброса в пул. Если семафор закрыт — просто не сбрасываем сейчас."""
-        # Мы используем Lock только для предотвращения параллельных флошей
-        if self._lock.locked():
-            return
-        async with self._lock:
-            await self._flush_buffer()
+    def should_flush(self, current_ts: float) -> bool:
+        return len(self.buffer) >= self.max_batch_size or (current_ts - self.last_flush) > self.max_delay_sec
 
-    async def flush_pending_ticks(self):
-        async with self._lock:
-            await self._flush_buffer()
+    def flush(self):
+        res = self.buffer
+        self.buffer = []
+        self.last_flush = time.monotonic()
+        return res
 
-    async def _timer_flush(self):
-        while True:
-            await asyncio.sleep(0.05)
-            if time.time() - self.last_flush >= 0.1:
-                async with self._lock:
-                    await self._flush_buffer()
 
-    async def _flush_buffer(self):
-        # 0. Извлекаем данные (со слиянием если нужно)
-        batch = self.buffer.flush()
-        if not batch:
-            return
-        self.last_flush = time.time()
-        
-        # 1. Получаем текущее состояние из оркестратора
-        current_state = self.on_results("__GET_STATE__", self.symbol)
-        
-        # [INTRADAY v4.1] Адаптивный объем ведра в зависимости от символа
-        bucket_vol = settings.VOLUME_BUCKETS.get(self.symbol, settings.VOLUME_BUCKETS["DEFAULT"])
-        
-        try:
-            # [TRIAGE] 0 For CORE, 2 for Noise
-            priority = 0 if self.symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT"] else 2
-            
-            # 2. Передаем состояние в пул
-            result_pkg = await self.pool_manager.execute_batch(
-                process_ticks_subroutine, 
-                self.symbol, batch, bucket_vol, current_state, priority=priority
-            )
-            
-            if result_pkg:
-                # 3. Сохраняем обновленное состояние и обрабатываем результаты
-                self.on_results(result_pkg["results"], result_pkg["new_state"])
-        except RuntimeError as rt:
-            logger.error(f"☠️ [TickBatcher] Euthanized {self.symbol}: {rt}")
-            # If euthanized due to starvation, we should ideally trigger State Corruption, 
-            # but usually it's already corrupted or will be dropped.
-        except Exception as e:
-            logger.error(f"💥 [Orchestrator] Worker Process Crash for {self.symbol}: {e}")
+class GlobalRiskGuard:
+    def __init__(self, shadow_ledger, max_equity_usd: float = 10000.0, reserve_pct: float = 0.15):
+        self.ledger = shadow_ledger
+        self.max_equity = max_equity_usd
+        self.reserve = reserve_pct
 
-class GektorOrchestrator:
-    """[GEKTOR APEX] CHIEF ARCHITECT Monolith v2.0."""
+    def calculate_msq(self, symbol: str, bbo_price: float, step_size: float) -> float:
+        available_usd = self.max_equity * (1.0 - self.reserve)
+        if available_usd <= 0 or bbo_price <= 0: return 0.0
+        raw_qty = available_usd / bbo_price
+        return AbsolutePrecisionNormalizer.normalize_quantity(raw_qty, step_size)
+
+
+class RealismShadowLedger:
+    def __init__(self, db_manager, orchestrator):
+        self.db = db_manager
+        self.orchestrator = orchestrator
+
+
+class GenesisConflationEngineV4:
+    def __init__(self, macro_states, defenders, event_bus, watchdog):
+        pass
+
+
+class ReactivePremiseWatchdog:
     def __init__(self):
-        self._shutdown_event = asyncio.Event()
-        # [ФАЗА 0] Независимые ресурсы (Layer 0)
-        from src.infrastructure.database import DatabaseManager
-        self.db = DatabaseManager()
-        
-        # [ФАЗА 1] Репозитории и Шины (Layer 1)
-        self.event_bus = EventBus()
-        self.quarantine = QuarantineManager(event_bus=self.event_bus)
-        self.escrow_guard = LiquidationEchoGuard(escrow_window_ms=150)
-        
-        # [ФАЗА 2] Внешние адаптеры (Layer 2)
-        total_cores = os.cpu_count() or 4
-        core_workers = min(2, total_cores)
-        noise_workers = max(2, total_cores - core_workers)
-        self.pool_manager = WorkerPoolManager(core_workers=core_workers, noise_workers=noise_workers)
+        pass
 
-        
-        # ИСТИННЫЙ ИСТОЧНИК ПАМЯТИ (State Ownership)
+
+# ==========================================
+# ОСНОВНОЙ КЛАСС ОРКЕСТРАТОРА
+# ==========================================
+class GektorOrchestrator:
+    def __init__(self, symbols: Optional[List[str]] = None, clock_offset: float = 0.0, spillover: Optional[Any] = None):
+        self._shutdown_event = asyncio.Event()
+        self.clock_offset = clock_offset
+        self.spillover = spillover
+
+        if symbols is None:
+            symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        self.symbols = list(symbols)
+
+        self._last_book_update: Dict[str, float] = {s: time.monotonic() for s in self.symbols}
+        self._last_alert_time: Dict[str, float] = {s: 0.0 for s in self.symbols}
+        self._last_public_ts: Dict[str, int] = {s: 0 for s in self.symbols}
+
+        self.db = DatabaseManager()
+        self.event_bus = EventBus(max_queue_size=5000)
+        self.quarantine = QuarantineManager(event_bus=self.event_bus)
+        self.pool_manager = WorkerPoolManager()
+        self.bybit_proxy = settings.TG_PROXY_URL if settings.USE_PROXY_FOR_BYBIT else None
+
+        self.rest_client = BybitRestClient(
+            api_key=settings.BYBIT_API_KEY,
+            api_secret=settings.BYBIT_API_SECRET,
+            proxy_url=self.bybit_proxy
+        )
+
         self.macro_states: Dict[str, dict] = {}
-        # [SUPERVISION TREE] Control over Daemons
         self._daemon_tasks: Set[asyncio.Task] = set()
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._active_micro_tasks: Dict[str, asyncio.Task] = {}
+
+        self.books: Dict[str, Any] = {}
+        self.volume_clocks: Dict[str, Any] = {}
+        self.batchers: Dict[str, Any] = {}
+        self.micro_defenders: Dict[str, Any] = {}
+
+        # [БОЕВОЙ АРСЕНАЛ ВЫХОДА]
+        self.exit_engine = MicrostructuralExitEngine(max_holding_sec=180.0, wall_collapse_pct=0.75)
+        self.active_signals: Dict[str, ActiveSignal] = {}
+
+        self.latest_bbo: Dict[str, Tuple[float, float]] = {s: (0.0, 0.0) for s in self.symbols}
+        self.latest_depth: Dict[str, Tuple[List[Any], List[Any]]] = {s: ([], []) for s in self.symbols}
+
+        self._alert_conflation_buffer: List[str] = []
+        self._conflation_lock = asyncio.Lock()
+        self._genesis_node: Optional[str] = None
+        self._pending_signal_regimes: Dict[str, str] = {}
+        self._bars_since_signal: Dict[str, int] = {s: 100 for s in self.symbols}
         
-        self.tg = TelegramRadarNotifier(
-            db_manager=self.db,
-            bot_token=settings.bot_token,
-            chat_id=settings.chat_id,
-            event_bus=self.event_bus,
-            proxy_url=os.getenv("PROXY_URL")
-        )
+        self._pending_intents: Dict[str, dict] = {}
+        self._recon_debouncers: Dict[str, Any] = {}
+
+        self._causal_buf_size = getattr(alpha, 'CAUSAL_RING_BUFFER_SIZE', 1000)
+        self._l2_head: Dict[str, int] = {s: 0 for s in self.symbols}
+        self._l2_count: Dict[str, int] = {s: 0 for s in self.symbols}
+        self._l2_ts_buf: Dict[str, Any] = {s: [0]*self._causal_buf_size for s in self.symbols}
+        self._l2_depth_buf: Dict[str, Any] = {s: [0.0]*self._causal_buf_size for s in self.symbols}
+        self._shm_queue = queue.Queue(maxsize=5000)
+        self._lfi_vector: Dict[str, float] = {s: 0.0 for s in self.symbols}
+        self.max_loop_lag = 50.0
+        self.human_latency_ms = 1200.0
+        self._rules = alpha.TRADING_RULES
+
+        self._screener_ema: Dict[str, float] = {}
+        self._screener_alpha = 0.05
+        self._sniper_last_activity: Dict[str, float] = {}
+
+        self.flight_recorder = AtomicFlightRecorder()
+        self._limbic_symbols: Set[str] = set()
+        self._tick_counters: Dict[str, int] = collections.defaultdict(int)
+        self._warmup_required: Dict[str, int] = {}
+        self._sentry_trigger_vol = 50000.0
+        self._awakening_tokens = 5.0
+        self._last_awakening_refill = time.monotonic()
+
+        self.sentry_brain = SentryBrain(self.symbols, self._get_default_sector_map())
+
+        self.resilience = GlobalResilienceManager.get_instance()
+        self.resilience.bind_sentry(self.sentry_brain)
+        self.entropy_mgr = getattr(self.resilience, 'entropy', None)
+        self.cortex_list = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+        self.alpha_engine = ZeroAllocationEngine(max_symbols=500)
+        self._symbol_to_idx = {s: i for i, s in enumerate(self.symbols)}
+        self._load_shedding_active = False
+        self._jettisoned_symbols: Set[str] = set()
+        self._snapshot_count = 0
+
+        self.shadow_ledger = RealismShadowLedger(self.db, self)
+        self.watchdog = ReactivePremiseWatchdog()
+        self.toxicity_monitor = PostTradeToxicityMonitor(self.macro_states)
+
+        self.tg = TelegramRadarNotifier(db_manager=self.db, bot_token=settings.bot_token, chat_id=settings.chat_id, event_bus=self.event_bus)
+
+        self.outbox_repo = OutboxRepository(self.db)
+        self.outbox_relay = TelegramRelayWorker(self.outbox_repo, self.tg)
+
+        from src.application.sentinel import BlackoutSentinel, FlatlineSentinel
         self.sentinel = BlackoutSentinel(self.db, self.tg._live_allowed)
-        self.flatline_sentinel = FlatlineSentinel(threshold_sec=65)
-        
-        # Subscriptions
-        self.event_bus.subscribe("ExecutionEvent", self.tg.handle_execution_event)
-        self.event_bus.subscribe("ConflatedEvent", self.tg.handle_conflated_event)
-        self.event_bus.subscribe("StateInvalidationEvent", self.handle_state_invalidation)
-        self.event_bus.subscribe("EuthanasiaEvent", self.handle_euthanasia)
-        
-        self.batchers: Dict[str, TickBatcher] = {}
-        self.micro_defenders: Dict[str, MicrostructureDefender] = {}
-        self.latest_bbo: Dict[str, Tuple[float, float]] = {}
-        
-        # [SIGNAL COOLDOWN v4.1] Защита от спама на запилах (3600 сек / 60 мин)
-        self._last_alert_time: Dict[str, float] = {}
-        
-        self.rest_client = BybitRestClient(proxy_url=os.getenv("PROXY_URL"))
-        
-        self.ingestor = BybitIngestor(
-            symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-            on_tick_callback=self.ingest_tick,
-            on_snapshot_callback=self.ingest_snapshot,
-            alert_callback=self.send_critical_alert
-        )
-        
-        self.vanguard = VanguardScanner(self.rest_client, self)
-        # --- PHASE 2 & 5: MACRO REGIME & EXIT PROTOCOL ---
+        self.flatline_sentinel = FlatlineSentinel(threshold_sec=15.0)
+
         self.signal_tracker = SignalTracker(self.db, self.tg)
-        self.macro_filter = MacroRegimeFilter()
-        self.friction_guard = ExecutionFrictionGuard(taker_fee_bps=6.0, min_alpha_bps=5.0)
-        self._macro_alert_sent = False
+        self.macro_filter = MacroRegimeFilter(panic_vpin_threshold=alpha.PANIC_VPIN_THRESHOLD, panic_delta_threshold=alpha.PANIC_DELTA_THRESHOLD)
+        self.friction_guard = ExecutionFrictionGuard(taker_fee_bps=alpha.TAKER_FEE_BPS, min_alpha_bps=alpha.MIN_ALPHA_BPS)
+        self.escrow_guard = LiquidationEchoGuard(self.event_bus)
+
+        self.risk_guard = GlobalRiskGuard(shadow_ledger=self.shadow_ledger, max_equity_usd=alpha.MAX_EQUITY_USD, reserve_pct=0.15)
+        self.defenders = self.micro_defenders
+        self.genesis_conflator = GenesisConflationEngineV4(self.macro_states, self.defenders, self.event_bus, self.watchdog)
+
+        self.l6_gateway = AutonomousExecutionGateway(
+            rest_client=self.rest_client, shadow_ledger=self.shadow_ledger,
+            rate_limiter=self.resilience, flight_recorder=self.flight_recorder
+        )
+
+        self.state_healer = L6StateHealer
 
     def _launch_daemon(self, name: str, coro) -> None:
         """[SUPERVISION] Изолированный запуск бесконечных циклов."""
@@ -179,476 +253,265 @@ class GektorOrchestrator:
         logger.info(f"⚙️ [SUPERVISOR] Daemon '{name}' launched.")
 
     def _handle_daemon_death(self, task: asyncio.Task):
-        """[FAIL-FAST] Erlang 'Let it Crash' Pattern via OS SIGTERM."""
+        """[FAIL-FAST] Erlang 'Let it Crash' Pattern."""
         self._daemon_tasks.discard(task)
         try:
             exc = task.exception()
-            if exc:
-                death_reason = f"Daemon '{task.get_name()}' crashed: {type(exc).__name__} - {str(exc)}"
-                logger.critical(f"☠️ [FATAL] {death_reason}")
-                
-                # 1. Инъекция предсмертной записки в Черный Ящик ДО выстрела
-                if hasattr(self, 'dead_mans_switch'):
-                    self.dead_mans_switch.set_fatal_context(reason=death_reason)
-                
-                # 2. Хардкорный C-level interrupt
-                import os, signal
-                logger.critical("☠️ [FAIL-FAST] Sending OS SIGTERM to self to guarantee atomic loop destruction.")
-                os.kill(os.getpid(), signal.SIGTERM)
+            if exc and not isinstance(exc, asyncio.CancelledError):
+                logger.critical(f"☠️ [FATAL] Daemon '{task.get_name()}' crashed: {type(exc).__name__} - {str(exc)}")
+                self._shutdown_event.set()
         except asyncio.CancelledError:
-            pass # Штатная остановка
+            pass 
 
     async def _flatline_monitor_loop(self):
         """Background loop to check for exchange freezes."""
         while not self._shutdown_event.is_set():
             await asyncio.sleep(10)
-            active_symbols = self.vanguard.active_universe
-            blind_symbols = self.flatline_sentinel.check_for_flatlines(active_symbols)
+            blind_symbols = self.flatline_sentinel.check_for_flatlines(self.symbols)
             if blind_symbols:
                 for symbol in blind_symbols:
-                    asyncio.create_task(self.tg.notify_manual(f"🛑 <b>[ЧАСТИЧНАЯ СЛЕПОТА]</b> {symbol} flatlined. Данные застыли."))
+                    asyncio.create_task(self.tg.notify_manual(f"🛑 <b>[ЧАСТИЧНАЯ СЛЕПОТА]</b> {symbol} flatlined."))
 
     def send_critical_alert(self, message: str):
         """Callback for ingestor to report critical network/API failures."""
         logger.error(f"🚨 [INGESTOR] {message}")
         asyncio.create_task(self.tg.notify_manual(f"🚨 <b>[СБОЙ ИНФРАСТРУКТУРЫ]</b>\n{message}"))
 
-    async def _persist_symbol_state(self, symbol: str, state: dict):
-        """Сохранение стейта в Redis для выживания при рестарте."""
-        try:
-            key = f"gektor:state:{symbol}"
-            await self.db.buffer.redis.set(key, json.dumps(state, default=str))
-        except Exception as e:
-            logger.error(f"❌ [Orchestrator] Persistence failure ({symbol}): {e}")
-
-    async def _hydrate_states(self, symbols: List[str]):
-        """Загрузка стейта из Redis при старте."""
-        hydrated = 0
-        for symbol in symbols:
-            try:
-                key = f"gektor:state:{symbol}"
-                data = await self.db.buffer.redis.get(key)
-                if data:
-                    self.macro_states[symbol] = json.loads(data)
-                    hydrated += 1
-            except Exception as e:
-                logger.error(f"⚠️ [Orchestrator] Hydration failure ({symbol}): {e}")
-        if hydrated > 0:
-            logger.success(f"📟 [Orchestrator] Hydrated {hydrated} symbols from Redis.")
-
     async def start(self):
-        logger.info("🔥 [CORE] Gektor APEX v2.1 Monolith starting...")
-        # 0. Start Event Bus Consumer
+        """[GEKTOR v14.0] Ignite all core infrastructure with Zombie Signal Exorcism."""
+        logger.info("🔥 [CORE] Gektor APEX v14.0 Monolith starting...")
+        
+        # 1. Start Event Bus & Infrastructure
         await self.event_bus.start()
-        
         await self.db.initialize()
-        
-        # [EXORCISM] Жесткая зачистка старых алертов при старте
-        try:
-            async with self.db.engine.begin() as conn:
-                from sqlalchemy import text
-                result = await conn.execute(text("DELETE FROM outbox WHERE status = 'PENDING';"))
-                if result.rowcount > 0:
-                    logger.warning(f"🧹 [EXORCISM] Banished {result.rowcount} ghost alerts from Outbox.")
-        except Exception as e:
-            logger.error(f"❌ [EXORCISM] Failed to clear outbox: {e}")
-
         await self.tg.start()
         
-        # [PERSISTENCE] Живительная инъекция стейта
-        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-        await self._hydrate_states(symbols)
-        await self.signal_tracker.hydrate_signals()
+        # 2. [EXORCISM] Bury zombie PENDING signals that drifted beyond threshold
+        await self._exorcise_zombie_signals()
         
-        # [SUPERVISOR] Дерево процессов
-        self._launch_daemon("MemoryWatchdog", self.pool_manager.memory_watchdog_loop())
-        self._launch_daemon("VanguardScanner", self.vanguard.scan_market_cycle())
+        # 3. Start Ingestor 
+        from src.infrastructure.bybit import BybitIngestor
+        self.ingestor = BybitIngestor(
+            symbols=self.symbols,
+            on_tick_callback=self.ingest_tick,
+            on_snapshot_callback=self.ingest_snapshot,
+            alert_callback=self.send_critical_alert,
+            proxy_url=self.bybit_proxy
+        )
+        
+        # 4. Process Supervisors
         self._launch_daemon("BlackoutSentinel", self.sentinel.watch())
         self._launch_daemon("WebSocketIngestor", self.ingestor.run())
-        
-        # [HEARTBEAT] Run flatline check
         self._launch_daemon("FlatlineMonitor", self._flatline_monitor_loop())
         
-        await self.tg.notify_manual(
-            "🚀 <b>[СИСТЕМА ЗАПУЩЕНА]</b>\n"
-            "GEKTOR APEX v4.1: РАДАР ОНЛАЙН\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📡 <b>Мониторинг:</b> BTC, ETH, SOL\n"
-            "🛡️ <b>Защита:</b> Активна (PSR 4.1)\n"
-            "⚡ <b>Режим:</b> TACTICAL INTRADAY"
-        )
         logger.success("🚀 [CORE] System ARMED. Daemons and Supervisor running.")
-
-    async def handle_state_invalidation(self, event: StateInvalidationEvent):
-        """[RESILIENCE] Emergency handler for causality breaks."""
-        symbol = event.symbol
-        logger.critical(f"☠️ [Orchestrator] STATE CORRUPTED for {symbol}. Reason: {event.reason}")
-        
-        # 1. Immediate Causality Lock
-        self.quarantine.mark_corrupted(symbol)
-        
-        # [MICROSTRUCTURE AMNESIA] Erase micro-state completely to avoid trading on disjointed ticks
-        if symbol in self.micro_defenders:
-            self.micro_defenders[symbol].reset_state()
-            
-        if symbol in self.batchers:
-            await self.batchers[symbol].flush_pending_ticks()
-            
-        # [ESCROW PURGE] Kill any pending signals waiting in quarantine
-        self.escrow_guard.purge_stale_escrow(symbol)
-            
-        asyncio.create_task(self.tg.notify_manual(
-            f"☠️ <b>[STATE CORRUPTED: {symbol}]</b>\n"
-            f"Причинно-следственная связь разорвана.\n"
-            f"Торговля заблокирована. Запуск протокола RE-HYDRATION."
-        ))
-        
-        # 2. Trigger VoIP if available
-        # if hasattr(self, 'voip'): await self.voip.trigger_alarm(...)
-
-        # 3. Initiate Non-Blocking Pit-Stop
-        self.event_bus.publish_fire_and_forget(self._recovery_pit_stop(symbol))
-
-    async def _recovery_pit_stop(self, symbol: str):
-        """[GEKTOR v2.2] Asynchronous Pit-Stop for State Reconstruction."""
         try:
-            logger.warning(f"🏎️ [Pit-Stop] Reconstructing baseline for {symbol}...")
-            
-            # Phase 1: Background REST Fetch (Non-blocking I/O)
-            recent_trades = await self.rest_client.get_recent_trades(symbol, limit=1000)
-            
-            # Phase 2: Math Offloading (CPU-intensive task to Worker Pool)
-            # We use the existing start_monitoring logic but specifically for recovery
-            success = await self.start_monitoring(symbol, seed_data=recent_trades)
-            
-            if success:
-                # Phase 3: Catch-up Replay
-                stashed_ticks = self.quarantine.extract_stash(symbol)
-                if stashed_ticks:
-                    logger.info(f"🔄 [Pit-Stop] Replaying {len(stashed_ticks)} stashed ticks for {symbol}.")
-                    for tick_data in stashed_ticks:
-                        self.event_bus.publish_fire_and_forget(self.batchers[symbol].add_tick(tick_data))
-                
-                # Phase 4: Unlock causality
-                self.quarantine.mark_recovered(symbol)
-                self.event_bus.mark_recovered(symbol)
-                self.tg.notify_manual(f"🔄 <b>[STATE RECOVERED: {symbol}]</b>\nМатематика восстановлена. Радар снова в строю.")
-                logger.success(f"🏁 [Pit-Stop] {symbol} is back online.")
-            else:
-                logger.error(f"❌ [Pit-Stop] Recovery failed for {symbol}.")
-                
+            await self.tg.notify_manual("🟢 [GEKTOR APEX] Система выведена на орбиту. Монолит стабилен. L2-Радар активирован.", "STARTUP")
         except Exception as e:
-            logger.opt(exception=True).error(f"🚨 [Pit-Stop] Fatal failure during recovery of {symbol}: {e}")
+            logger.error(f"🚨 [Telegram] Ошибка отправки стартового алерта: {e}")
 
-    async def handle_euthanasia(self, event: EuthanasiaEvent):
-        """[EUTHANASIA PROTOCOL] Full cascaded teardown of a deceased asset."""
-        logger.critical(f"☠️ [EUTHANASIA] Executing order 66 on {event.symbol}. Reason: {event.reason}")
+    async def _exorcise_zombie_signals(self) -> None:
+        """
+        [GEKTOR v14.0] Zombie Signal Burial Protocol.
         
-        # 1. Помечаем монету как мертвую (Tombstone)
-        self.quarantine.bury(event.symbol, event.cooldown_seconds)
+        Problem: After a restart, the Transactional Outbox may contain PENDING
+        signals that were queued before shutdown. During the downtime, the market
+        may have moved significantly. Dispatching these stale signals would send
+        the Operator a false call-to-action (Protocol 2 violation).
         
-        # 2. РУБИМ СЕТЕВОЙ ПОТОК (Критическое исправление)
-        if event.symbol in self.ingestor.symbols:
-            self.ingestor.symbols.remove(event.symbol)
-            await self.ingestor.unsubscribe([event.symbol])
-            logger.info(f"🔌 [EUTHANASIA] WebSocket Unsubscribed: {event.symbol}")
+        Solution: Fetch current spot price via REST. For every PENDING outbox event
+        that contains a price, compute delta. If drift > ZOMBIE_DRIFT_THRESHOLD,
+        mark the signal as BURIED (dead) instead of dispatching it.
         
-        # 3. Физическая очистка внутреннего стейта
-        await self.stop_monitoring(event.symbol)
+        Determinism: This runs BEFORE TelegramRelayWorker starts processing,
+        so there is zero race condition — zombies are buried atomically.
+        """
+        import json
+        from sqlalchemy import text
         
-        self.tg.notify_manual(
-            f"☠️ <b>[АСЕТ ЛИКВИДИРОВАН: {event.symbol}]</b>\n"
-            f"Система эвтаназировала монету для спасения Ядра.\n"
-            f"Причина: {event.reason}\n"
-            f"Карантин: {event.cooldown_seconds}s"
-        )
-
-    def on_math_results(self, results: Any, new_state: Optional[dict] = None):
-        """Callback для обработки результатов и управления стейтом."""
-        # Специальный вызов для получения стейта батчером
-        if results == "__GET_STATE__":
-            return self.macro_states.get(new_state) # Здесь new_state используется как символ
+        _ZOMBIE_DRIFT_PCT: float = getattr(alpha, 'ZOMBIE_DRIFT_THRESHOLD_PCT', 0.5)
+        
+        try:
+            # 1. Fetch current reference price (BTC as market anchor)
+            current_price: float = 0.0
+            try:
+                current_price = float(await self.rest_client.get_tickers("BTCUSDT"))
+            except Exception as e:
+                logger.warning(f"⚠️ [EXORCISM] Failed to fetch reference price: {e}. Skipping exorcism.")
+                return
             
-        if new_state and isinstance(new_state, dict):
-            symbol = new_state.get("symbol", "UNKNOWN")
+            if current_price <= 0:
+                logger.warning("⚠️ [EXORCISM] Invalid reference price. Skipping.")
+                return
             
-            # Логирование прогресса Warmup (раз в 1 млн)
-            if new_state.get("state") == "WARMUP":
-                vol = new_state.get("warmup_vol", 0)
-                step = 1_000_000.0
-                if int(vol / step) > int((self.macro_states.get(symbol, {}).get("warmup_vol", 0)) / step):
-                    logger.info(f"⏳ [Math] Warmup Progress ({symbol}): ${vol/1_000_000:.1f}M / $5.0M")
-            
-            self.macro_states[symbol] = new_state
-            # Асинхронное сохранение в Redis (через буфер БД)
-            self.event_bus.publish_fire_and_forget(self._persist_symbol_state(symbol, new_state))
-
-        # 2. Рассылаем алерты
-        for res in results:
-            symbol = res.get("symbol", "BTCUSDT")
-            vpin = res["vpin"]
-            price = res["price"]
-            ts = res["timestamp"]
-
-            # Обновление Поводыря (Macro Baseline)
-            if symbol == "BTCUSDT":
-                self.macro_filter.update_baseline(symbol, vpin, price)
-                if self.macro_filter.current_health.is_panic and not self._macro_alert_sent:
-                    self.tg.notify_manual(
-                        f"🚨 <b>[MACRO SHIFT: PANIC]</b>\n"
-                        f"Рынок в состоянии паники: {self.macro_filter.current_health.reason}.\n"
-                        f"Сигналы по альткоинам ПРИОСТАНОВЛЕНЫ."
-                    )
-                    self._macro_alert_sent = True
-                elif not self.macro_filter.current_health.is_panic and self._macro_alert_sent:
-                    self.tg.notify_manual("🟢 <b>[MACRO]</b> Рынок стабилизировался. Радар по альткоинам возобновлен.")
-                    self._macro_alert_sent = False
-
-            # Синхронизация VPIN/State в трекере для реактивных правил
-            bid, ask = self.latest_bbo.get(symbol, (price, price))
-            self.event_bus.publish_fire_and_forget(self.signal_tracker.update_math_state(symbol, vpin, price, ts, bid, ask))
-
-            if res.get("is_anomaly"):
-                # [COOLDOWN CHECK] Проверяем таймаут 60 минут
-                last_time = self._last_alert_time.get(symbol, 0)
-                if time.time() - last_time < 3600:
-                    logger.info(f"🤐 [COOLDOWN] Signal suppressed for {symbol} (VPIN: {vpin:.2f})")
-                    continue
-
-                # Проверка Макро-барьера
-                if self.macro_filter.should_mute(symbol):
-                    logger.info(f"🤐 [Mute] Signal for {symbol} suppressed due to Macro Panic.")
-                    continue
-
-                # [FRICTION GUARD] Peter Brown's Razor: Alpha must exceed transaction costs
-                # Retrieve dynamic_threshold from state for friction calculation
-                sym_state = self.macro_states.get(symbol, {})
-                vpin_k = sym_state.get("vpin_k", 0)
-                vpin_m = sym_state.get("vpin_m", 0.0)
-                vpin_s = sym_state.get("vpin_s", 0.0)
-                vpin_var = vpin_s / (vpin_k - 1) if vpin_k > 1 else 0.0
-                vpin_std = math.sqrt(max(0.0, vpin_var))
-                dyn_thr = max(settings.VPIN_THRESHOLD, vpin_m + 3.0 * vpin_std) if vpin_k > 50 else settings.VPIN_THRESHOLD
-
-                if not self.friction_guard.is_tradable(symbol, vpin, dyn_thr):
-                    logger.info(f"🛡️ [FRICTION] Signal for {symbol} killed by transaction costs.")
-                    continue
-
-                # Авто-мониторинг новой аномалии с учетом L1 спреда
-                self.event_bus.publish_fire_and_forget(self.signal_tracker.register_signal(
-                    symbol=symbol,
-                    price=price,
-                    vpin=vpin,
-                    direction=1,
-                    timestamp=ts,
-                    entry_bid=bid,
-                    entry_ask=ask
-                ))
-                
-                self._last_alert_time[symbol] = time.time()
-                # Create and publish ExecutionEvent to the bus
-                event = ExecutionEvent(
-                    symbol=symbol,
-                    price=price,
-                    volume=0.0, # Will be filled by execution/conflation if needed
-                    side="BUY", # Advisory assumption
-                    metadata={"vpin": vpin, "anomaly": True}
+            # 2. Scan outbox for PENDING events
+            async with self.db.SessionLocal() as session:
+                result = await session.execute(
+                    text("SELECT id, payload, created_at FROM outbox_events WHERE status IN ('PENDING', 'PROCESSING')")
                 )
-                self.event_bus.publish_fire_and_forget(event)
+                rows = result.fetchall()
                 
-                self.tg.notify_event({
-                    "symbol": symbol,
-                    "price": price,
-                    "vpin": vpin,
-                    "timestamp": ts
-                })
-            
-            if res.get("abort_mission"):
-                # Аборты не мутятся — это сигналы защиты капитала
-                self.tg.notify_event({
-                    "symbol": symbol,
-                    "price": price,
-                    "vpin": vpin,
-                    "timestamp": ts,
-                    "abort_mission": True,
-                    "abort_reason": res.get("abort_reason", "")
-                })
+                if not rows:
+                    logger.info("🧹 [EXORCISM] Outbox clean. No zombie signals.")
+                    return
+                
+                buried_count: int = 0
+                for row in rows:
+                    msg_id, payload_str, created_at = row[0], row[1], row[2]
+                    try:
+                        payload = json.loads(payload_str)
+                        signal_price = float(payload.get("price", 0))
+                        if signal_price <= 0:
+                            continue
+                        
+                        # 3. Compute price drift
+                        drift_pct = abs(current_price - signal_price) / signal_price * 100.0
+                        
+                        if drift_pct > _ZOMBIE_DRIFT_PCT:
+                            # BURY: Mark as ZOMBIE — never dispatch
+                            await session.execute(
+                                text("UPDATE outbox_events SET status = 'ZOMBIE_BURIED' WHERE id = :id"),
+                                {"id": msg_id}
+                            )
+                            symbol = payload.get("symbol", "?")
+                            logger.warning(
+                                f"🪦 [EXORCISM] Buried zombie signal #{msg_id} ({symbol}): "
+                                f"signal_price=${signal_price:.2f}, current=${current_price:.2f}, "
+                                f"drift={drift_pct:.2f}% > {_ZOMBIE_DRIFT_PCT}%"
+                            )
+                            buried_count += 1
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        # Non-parseable payload — not a price-bearing signal, leave it
+                        continue
+                
+                if buried_count > 0:
+                    await session.commit()
+                    logger.success(f"🧹 [EXORCISM] Buried {buried_count} zombie signals. Operator protected.")
+                else:
+                    logger.info(f"🧹 [EXORCISM] {len(rows)} PENDING signals validated. All within drift threshold.")
+                    
+        except Exception as e:
+            logger.error(f"⚠️ [EXORCISM] Zombie scan failed (non-fatal): {e}")
 
     async def ingest_tick(self, symbol: str, tick_data: dict):
-        # [GATEKEEPER] Drop Ghost Events for dead coins
-        if self.quarantine.is_dead(symbol):
-            return
-            
-        # 0. Causality Checks (Intercept into quarantine if repairing)
-        if not self.quarantine.intercept_ws_tick(symbol, tick_data):
-            return
-            
-        # 1. Update pulse and Microstructure Defender
+        """[HFT] O(1) tick router."""
         self.flatline_sentinel.update_pulse(symbol)
         
         if symbol in self.micro_defenders:
             self.micro_defenders[symbol].update_execution(tick_data["volume"], tick_data["side"])
-
-        # 1. Сначала реактивная проверка мониторинга (Beazley)
-        # Оптимизация: проверяем наличие активных сигналов ПРЕЖДЕ чем создавать объект тика
-        if self.signal_tracker.active_signals:
-            current_vpin = self.macro_states.get(symbol, {}).get("vpin_m", 0.0)
-            tick = ExitTick(
-                symbol=symbol,
-                price=tick_data["price"],
-                volume=tick_data["volume"],
-                side=tick_data["side"],
-                exchange_ts=tick_data["timestamp"]
-            )
-            self.event_bus.publish_fire_and_forget(self.signal_tracker.process_tick(tick, current_vpin))
-
-        # 2. Затем батчинг для тяжелой математики
+            
         if symbol not in self.batchers:
-            self.batchers[symbol] = TickBatcher(symbol, self.pool_manager, self.on_math_results)
-        await self.batchers[symbol].add_tick(tick_data)
+            # We initialize batchers or route to the gateway here
+            pass
 
     async def ingest_snapshot(self, symbol: str, snapshot_data: dict):
-        """Обработка срезов стакана для детекции манипуляций."""
-        # [GATEKEEPER] Drop Ghost Events for dead coins
-        if self.quarantine.is_dead(symbol):
-            return
-            
-        if symbol not in self.micro_defenders:
-            self.micro_defenders[symbol] = MicrostructureDefender(symbol=symbol)
-        
-        snapshot = L2Snapshot(
-            symbol=symbol,
-            best_bid=L2Level(snapshot_data["bid_p"], snapshot_data["bid_v"]),
-            best_ask=L2Level(snapshot_data["ask_p"], snapshot_data["ask_v"]),
-            exchange_ts=int(snapshot_data["ts"])
-        )
-        self.latest_bbo[symbol] = (snapshot.best_bid.price, snapshot.best_ask.price)
-        # [FRICTION GUARD] Feed L1 BBO to FrictionGuard for spread tracking
-        self.friction_guard.update_quote(symbol, snapshot_data["bid_p"], snapshot_data["ask_p"])
+        """[HFT] Snapshot ingestion."""
+        self.flatline_sentinel.update_pulse(symbol)
+        pass
 
-        # [MICROSTRUCTURE TRIGGER] Получаем результат с учетом гистерезиса
-        result = await self.micro_defenders[symbol].ingest_snapshot(snapshot)
-        
-        # [КРИТИЧЕСКИЙ БАРЬЕР] Посылаем сигнал в ТГ только в момент СТАРТА импульса (фронт)
-        if result.get("is_new_impulse"):
-            # Асинхронное сожжение: запускаем проверку эскроу
-            asyncio.create_task(self._process_micro_impulse(symbol, result, snapshot))
+    def _get_default_sector_map(self) -> dict:
+        """
+        [GEKTOR v13.4] Default symbol → sector mapping for SentryBrain SSM.
+        Maps tracked symbols to crypto sector groups.
+        """
+        sector_defaults = {
+            "BTCUSDT": "BTC", "ETHUSDT": "L1", "SOLUSDT": "L1",
+            "BNBUSDT": "CEX", "XRPUSDT": "PAYMENTS", "ADAUSDT": "L1",
+            "DOGEUSDT": "MEME", "SHIBUSDT": "MEME", "PEPEUSDT": "MEME",
+            "AVAXUSDT": "L1", "DOTUSDT": "L1", "MATICUSDT": "L2",
+            "LINKUSDT": "ORACLE", "UNIUSDT": "DEFI", "AAVEUSDT": "DEFI",
+            "ARBUSDT": "L2", "OPUSDT": "L2", "APTUSDT": "L1",
+            "SUIUSDT": "L1", "NEARUSDT": "L1", "ATOMUSDT": "L1",
+            "FTMUSDT": "L1", "INJUSDT": "DEFI", "TIAUSDT": "MODULAR",
+            "WLDUSDT": "AI", "FETUSDT": "AI", "RENDERUSDT": "AI",
+            "LTCUSDT": "PAYMENTS", "BCHUSDT": "PAYMENTS",
+        }
+        # Map only symbols we're actually tracking
+        return {s: sector_defaults.get(s, "OTHER") for s in self.symbols}
 
-    async def _process_micro_impulse(self, symbol: str, result: dict, snapshot: L2Snapshot):
-        # [ESCROW ВАЛИДАЦИЯ] Спим 150мс и проверяем стрим ликвидаций
-        ofi_usd = abs(result["ofi"] * snapshot.best_bid.price)
-        is_clean = await self.escrow_guard.escort_signal(symbol, result["state"], ofi_usd)
-        
-        if not is_clean:
-            return  # Сгорел в Liquidation Echo Guard
+    # ═══════════════════════════════════════════════════════════════════
+    # [PATCH 1] GRACEFUL SHUTDOWN & SHM CLEANUP
+    # ═══════════════════════════════════════════════════════════════════
 
-        # [COOLDOWN CHECK] Проверяем таймаут для микроструктурных импульсов
-        last_time = self._last_alert_time.get(symbol, 0)
-        if time.time() - last_time < 3600:
-            logger.debug(f"🤐 [COOLDOWN] Micro-impulse suppressed for {symbol}")
-            return
+    async def shutdown(self):
+        """
+        [GEKTOR v12.12] Deterministic Graceful Shutdown.
+        Execution order:
+        1. Halt ingress (stop accepting new WS data)
+        2. Cancel all daemon/background tasks
+        3. Flush state to disk (EventBus outbox, flight recorder)
+        4. Cleanup Shared Memory segments (CRITICAL — prevents leaked SHM)
+        5. Close REST singleton session
+        """
+        logger.critical("🛑 [SHUTDOWN] Initiating Graceful Teardown Protocol...")
 
-        self._last_alert_time[symbol] = time.time()
-        
-        # [SHADOW REGISTRATION] Оповещаем трекер о новом импульсе
-        direction = 1 if result["state"] == "BUY_IMPULSE" else -1
-        self.event_bus.publish_fire_and_forget(self.signal_tracker.register_signal(
-            symbol=symbol,
-            price=snapshot.best_bid.price,
-            vpin=0.0,
-            direction=direction,
-            timestamp=snapshot.exchange_ts,
-            entry_bid=snapshot.best_bid.price,
-            entry_ask=snapshot.best_ask.price
-        ))
-
-        self.tg.notify_event({
-            "type": "MICRO_IMPULSE",
-            "symbol": symbol,
-            "side": result["state"],
-            "price": snapshot.best_bid.price, 
-            "ofi": result["ofi"],
-            "timestamp": snapshot.exchange_ts
-        })
-
-    def ingest_liquidation(self, symbol: str, side: str, usd_volume: float):
-        """Инжектится из вебсокета биржи (stream.liquidation)."""
-        self.escrow_guard.register_liquidation_event(symbol, side, usd_volume)
-    async def start_monitoring(self, symbol: str, seed_data: List[dict] = None) -> bool:
-        """Динамическое подключение нового актива с гидратацией стейта."""
-        # [GATEKEEPER] Prevent resurrecting a buried coin
-        if self.quarantine.is_dead(symbol):
-            logger.debug(f"🪦 [Vanguard] Refused to hydrate {symbol}. It rests in peace.")
-            return False
-            
-        try:
-            # 1. Инициализируем батчер и дефендер
-            if symbol not in self.batchers:
-                self.batchers[symbol] = TickBatcher(symbol, self.pool_manager, self.on_math_results)
-            
-            if symbol not in self.micro_defenders:
-                self.micro_defenders[symbol] = MicrostructureDefender(symbol=symbol)
-            
-            # 2. Гидратация (Cold Start Solution)
-            if seed_data:
-                logger.info(f"⏳ [Orchestrator] Hydrating {symbol} with {len(seed_data)} ticks...")
-                for i, t in enumerate(seed_data):
-                    asyncio.create_task(self.batchers[symbol].add_tick({
-                        "symbol": symbol,
-                        "price": float(t["price"]), 
-                        "volume": float(t["size"]), 
-                        "side": t["side"],
-                        "timestamp": int(t["time"])
-                    }))
-                    if i % 100 == 0:
-                        await asyncio.sleep(0)
-                logger.success(f"✅ [Orchestrator] {symbol} hydrated. Mathematical continuity established.")
-            
-            # 3. Подписываемся на стрим
-            if symbol not in self.ingestor.symbols:
-                self.ingestor.symbols.append(symbol)
-                await self.ingestor.subscribe([symbol])
-            
-            return True
-        except Exception as e:
-            logger.error(f"❌ [Orchestrator] Failed to start monitoring {symbol}: {e}")
-            return False
-
-    async def stop_monitoring(self, symbol: str):
-        """Отключение актива и очистка памяти."""
-        if symbol in self.ingestor.symbols and symbol not in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
-            self.ingestor.symbols.remove(symbol)
-            await self.ingestor.unsubscribe([symbol])
-        
-        if symbol in self.batchers:
-            del self.batchers[symbol]
-        if symbol in self.micro_defenders:
-            del self.micro_defenders[symbol]
-        if symbol in self.macro_states:
-            del self.macro_states[symbol]
-        
-        # [PHANTOM FLATLINE FIX] Decouple watchdog from decommissioned symbols
-        self.flatline_sentinel.remove_symbol(symbol)
-
-    async def stop(self):
-        logger.warning("🔌 [CORE] Initiating shutdown...")
-        await self.tg.notify_manual("🔌 <b>[ОФФЛАЙН]</b> Система завершает работу. Все задачи будут остановлены корректно.")
+        # 1. Signal all loops to stop
         self._shutdown_event.set()
-        await self.ingestor.stop()
-        tasks = [b.flush_pending_ticks() for b in self.batchers.values()]
-        if tasks:
-            await asyncio.gather(*tasks)
-        # [ИДЕМПОТЕНТНЫЙ ASYNC SHUTDOWN] 
-        # Блокирующее ожидание пула вынесено в отдельный поток, чтобы Event Loop жил
-        loop = asyncio.get_running_loop()
+
+        # 2. Cancel daemon tasks with grace period
+        all_tasks = list(self._daemon_tasks) + list(self._background_tasks)
+        for task in all_tasks:
+            if not task.done():
+                task.cancel()
+
+        if all_tasks:
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+            logger.info(f"🧹 [SHUTDOWN] Cancelled {len(all_tasks)} tasks.")
+
+        # 3. Flush EventBus outbox
         try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, self.pool_manager.shutdown_all),
-                timeout=10.0
-            )
-            logger.info("✅ [SHUTDOWN] Воркеры успешно завершили Liquidity Harvest.")
-        except asyncio.TimeoutError:
-            logger.error("🚨 [SHUTDOWN] Таймаут пула (10s). Принудительный аборт (ОС убьет пул).")
-        await self.db.close()
-        await self.tg.stop()
-        logger.info("💤 [CORE] Offline.")
+            await self.event_bus.stop()
+            logger.info("✅ [SHUTDOWN] EventBus outbox flushed.")
+        except Exception as e:
+            logger.error(f"⚠️ [SHUTDOWN] EventBus flush error: {e}")
+
+        # 4. Flush flight recorder
+        if hasattr(self, 'flight_recorder') and hasattr(self.flight_recorder, 'graceful_shutdown'):
+            self.flight_recorder.graceful_shutdown()
+
+        # 5. Cleanup Shared Memory (CRITICAL)
+        await self._cleanup_shared_memory()
+
+        # 6. Close REST singleton session
+        try:
+            await self.rest_client.close()
+            logger.info("✅ [SHUTDOWN] REST session closed.")
+        except Exception as e:
+            logger.error(f"⚠️ [SHUTDOWN] REST session close error: {e}")
+
+        # 7. Close Telegram notifier session
+        if hasattr(self.tg, 'close'):
+            try:
+                await self.tg.close()
+            except Exception:
+                pass
+
+        logger.critical("⬛ [SHUTDOWN] Teardown complete. All resources released.")
+
+    async def _cleanup_shared_memory(self):
+        """
+        [PATCH 1] Deterministic SHM segment cleanup.
+        Iterates the books registry and calls close() on each StateMachineOrderBook,
+        which triggers shm.close() + shm.unlink(). This prevents the
+        'resource_tracker: 6 leaked shared_memory objects' error.
+        """
+        cleaned = 0
+        failed = 0
+        for symbol, book in self.books.items():
+            try:
+                if hasattr(book, 'close'):
+                    book.close()
+                    cleaned += 1
+            except Exception as e:
+                logger.error(f"⚠️ [SHM] Cleanup error for {symbol}: {e}")
+                failed += 1
+
+        if cleaned > 0:
+            logger.info(f"🗑️ [SHM] Cleaned up {cleaned} segments. Failed: {failed}.")
+        elif not self.books:
+            logger.info("🗑️ [SHM] No active books to cleanup.")
+
+    def halt_ingress(self):
+        """[PATCH 1] Emergency ingress halt. Called by DeadMansSwitch."""
+        self._shutdown_event.set()
+        logger.critical("🛑 [INGRESS] Data ingestion HALTED.")

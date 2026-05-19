@@ -1,85 +1,93 @@
-# main.py
 import asyncio
-import signal
 import sys
-import os
-from dotenv import load_dotenv
-from loguru import logger
-from src.application.orchestrator import GektorOrchestrator
+import signal
+import logging
+from typing import NoReturn, Optional
 
-# [GEKTOR v2.0] Load environment variables
-load_dotenv()
-
-# Logger setup
-logger.remove()
-logger.add(
-    sys.stdout, 
-    level="INFO", 
-    colorize=True, 
-    format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
+# Настройка высокопроизводительного логгера
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
+logger = logging.getLogger("GEKTOR_RADAR")
 
-async def shutdown(loop, orchestrator=None, signal=None):
-    """[GEKTOR v2.0] BEAZLEY PROTOCOL: Global Task Sweep."""
-    if signal:
-        logger.info(f"🛑 [SHUTDOWN] Received exit signal {signal.name}...")
-    
-    if orchestrator:
+class GektorRadarCore:
+    """
+    Единая точка входа. Инкапсулирует инициализацию, Event Loop и Graceful Shutdown.
+    """
+    def __init__(self, env: str = "local"):
+        self.env = env
+        self._is_running = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    async def _alert_engine(self) -> None:
+        """
+        Изолированный асинхронный воркер для отправки Telegram-алертов.
+        Гарантирует, что сетевое трение API Telegram не заблокирует ингестию котировок.
+        """
+        logger.info(f"[ALERT ENGINE] Запущен в среде: {self.env}")
+        while self._is_running:
+            # TODO: Интеграция неблокирующей очереди (asyncio.Queue) или Outbox (SQLite) для алертов
+            await asyncio.sleep(1)
+
+    async def _radar_engine(self) -> None:
+        """
+        Основной квант-движок. Advisory Mode.
+        Никакой интеграции с REST/WS для отправки ордеров.
+        """
+        logger.info("[RADAR ENGINE] Поиск среднесрочных аномалий активирован.")
+        while self._is_running:
+            # TODO: Zero-Copy маппинг стаканов и каузальное сжатие (Dollar Bars)
+            await asyncio.sleep(0.1)
+
+    async def startup(self) -> None:
+        self._is_running = True
+        logger.info("[SYSTEM] Инициализация GEKTOR APEX (Advisory Mode)...")
+        
+        # Запуск подсистем конкурентно
+        await asyncio.gather(
+            self._alert_engine(),
+            self._radar_engine()
+        )
+
+    async def shutdown(self, sig: signal.Signals) -> None:
+        logger.warning(f"[SYSTEM] Получен сигнал {sig.name}. Начат Graceful Shutdown.")
+        self._is_running = False
+        
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        [task.cancel() for task in tasks]
+        
+        logger.info(f"[SYSTEM] Ожидание отмены {len(tasks)} фоновых задач...")
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._loop.stop()
+        logger.info("[SYSTEM] Контур безопасно обесточен.")
+
+def main() -> NoReturn:
+    # Оптимизация Event Loop (uvloop для Linux-сервера)
+    if sys.platform != "win32":
         try:
-            await orchestrator.stop()
-        except Exception as e:
-            logger.error(f"⚠️ [SHUTDOWN] Orchestrator stop error: {e}")
+            import uvloop
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        except ImportError:
+            logger.warning("uvloop не найден. Используется стандартный asyncio.")
 
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    logger.warning(f"🧹 [SHUTDOWN] Cancelling {len(tasks)} pending tasks...")
-    for task in tasks:
-        task.cancel()
-    
-    # Wait for tasks to cancel with timeout
-    await asyncio.gather(*tasks, return_exceptions=True)
-    logger.success("✅ [SHUTDOWN] Lifecycle complete. No zombies detected.")
-    loop.stop()
-
-def main():
-    """Unified Lifecycle Manager with Monotonic Resilience."""
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    
+    core = GektorRadarCore(env="production" if sys.platform != "win32" else "local")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
-    orchestrator = GektorOrchestrator()
-    
-    # Signal handling for Unix
-    if sys.platform != 'win32':
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(loop, orchestrator, s)))
-    
+    core._loop = loop
+
+    # Перехват системных сигналов для предотвращения повреждения стейта
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(core.shutdown(s)))
+
     try:
-        logger.info("🟢 [CORE] Radar Pipeline ENGAGED.")
-        loop.run_until_complete(orchestrator.start())
-        loop.run_forever()
-    except (KeyboardInterrupt, asyncio.CancelledError):
+        loop.run_until_complete(core.startup())
+    except asyncio.CancelledError:
         pass
-    except Exception as e:
-        logger.critical(f"☠️ [FATAL] Critical System Failure: {e}")
     finally:
-        # Final Sweep - THE BEAZLEY GUARDIAN
-        try:
-            # Timeout the shutdown to prevent hanging on dead ProcessPool queues
-            loop.run_until_complete(
-                asyncio.wait_for(shutdown(loop, orchestrator), timeout=10.0)
-            )
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.error(f"❌ [SHUTDOWN] Final teardown error (forced): {e}")
-        finally:
-            # Suppress BrokenPipeError noise from killed ProcessPool workers
-            import logging
-            logging.getLogger("concurrent.futures").setLevel(logging.CRITICAL)
-            if not loop.is_closed():
-                loop.close()
-            logger.info("🔌 [OFFLINE]")
-            sys.exit(0)
+        loop.close()
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()

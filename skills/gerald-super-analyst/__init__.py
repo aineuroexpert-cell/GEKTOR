@@ -1,1 +1,0 @@
-# Gerald Super Analyst Module

@@ -27,7 +27,7 @@ class BlackoutSentinel:
             # Check PENDING count in DB
             try:
                 async with self.db.engine.connect() as conn:
-                    result = await conn.execute(text("SELECT COUNT(*) FROM outbox WHERE status = 'PENDING'"))
+                    result = await conn.execute(text("SELECT COUNT(*) FROM outbox_events WHERE status = 'PENDING'"))
                     current_count = result.scalar() or 0
             except Exception as e:
                 logger.error(f"⚠️ [Sentinel] DB Healthcheck failed: {e}")
@@ -67,7 +67,7 @@ class FlatlineSentinel:
     Detects if a specific coin has stopped sending ticks (Exchange Freeze).
     Triggers [PARTIAL BLINDNESS] event to prevent trading on stale data.
     """
-    def __init__(self, threshold_sec: int = 65):
+    def __init__(self, threshold_sec: int = 15):
         self.threshold_sec = threshold_sec
         self._last_ticks: Dict[str, float] = {}
         self._blind_symbols: set[str] = set()

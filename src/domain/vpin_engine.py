@@ -1,11 +1,12 @@
-import math
-import logging
-from typing import Optional, List
-from dataclasses import dataclass
-
+import numpy as np
 from src.domain.dollar_bar import DollarBar
+from loguru import logger
+from src.shared.alpha_config import alpha
 
-logger = logging.getLogger("GEKTOR.QuantEngine")
+from dataclasses import dataclass
+from typing import Optional, List
+import math
+import time
 
 @dataclass(slots=True)
 class VPINSignal:
@@ -16,13 +17,13 @@ class VPINSignal:
 
 class O1VPINEngine:
     """
-    [GEKTOR v2.0] O(1) Кольцевой буфер для расчета VPIN и динамического Z-Score.
-    Встроенный фильтр поглощения: Trade Imbalance vs Price Impact.
+    [GEKTOR v4.1] O(1) NumPy Ring Buffer.
+    Eliminates GC overhead and Event Loop jitter during Global Flush.
     """
     __slots__ = [
         'window_size', 'volume_threshold', '_imbalances', '_index', '_is_filled',
         '_running_imbalance_sum', '_vpin_history', '_vpin_sum', '_vpin_sq_sum', 
-        '_anomaly_threshold_z', '_price_history'
+        '_anomaly_threshold_z', '_price_history', '_last_update_time'
     ]
 
     def __init__(self, window_size: int = 50, volume_threshold: float = 1_000_000.0, z_threshold: float = 2.5):
@@ -30,21 +31,24 @@ class O1VPINEngine:
         self.volume_threshold = volume_threshold
         self._anomaly_threshold_z = z_threshold
         
-        # Предаллоцированная память (Ring Buffer)
-        self._imbalances: List[float] = [0.0] * window_size
-        self._index: int = 0
-        self._is_filled: bool = False
-        self._running_imbalance_sum: float = 0.0
-
-        # Стейт для скользящего Z-Score (инкрементальная дисперсия)
-        self._vpin_history: List[float] = [0.0] * window_size
-        self._vpin_sum: float = 0.0
-        self._vpin_sq_sum: float = 0.0
+        # [PRE-ALLOCATION] Zero-Copy Infrastructure
+        self._imbalances = np.zeros(window_size, dtype=np.float64)
+        self._vpin_history = np.zeros(window_size, dtype=np.float64)
+        self._price_history = np.zeros(window_size, dtype=np.float64)
         
-        # [PRICE IMPACT FILTER] Ring buffer for price series
-        self._price_history: List[float] = [0.0] * window_size
+        self.reset_o1()
+
+    def reset_o1(self):
+        """O(1) Flush Protocol. No memory re-allocation."""
+        self._index = 0
+        self._is_filled = False
+        self._running_imbalance_sum = 0.0
+        self._vpin_sum = 0.0
+        self._vpin_sq_sum = 0.0
+        # NumPy arrays are reused; pointers are simply reset.
 
     def process_bar(self, bar: DollarBar) -> Optional[VPINSignal]:
+        import time
         buy_vol = bar.buy_volume_quote
         sell_vol = bar.sell_volume_quote
         price = bar.close_price
@@ -68,6 +72,21 @@ class O1VPINEngine:
         if self._index >= self.window_size:
             self._index = 0
             self._is_filled = True
+
+        # [TIME DECAY GUARD]
+        # Если между барами прошел огромный разрыв времени (ночная спячка),
+        # старые данные в окне должны потерять вес (Alpha Decay).
+        now = time.monotonic()
+        time_delta = now - getattr(self, '_last_update_time', now)
+        self._last_update_time = now
+        
+        # Если разрыв > 15 минут, применяем экспоненциальное затухание к накопленной статистике
+        if time_delta > alpha.VPIN_TIME_GAP_SEC:
+            decay = math.exp(-time_delta / (3600 * alpha.VPIN_DECAY_TAU_HOURS))
+            self._vpin_sum *= decay
+            self._vpin_sq_sum *= (decay ** 2)
+            self._running_imbalance_sum *= decay
+            logger.warning(f"⏳ [MathCore] Time Gap detected ({time_delta/60:.1f}m). Statistics decayed by {100*(1-decay):.1f}%.")
 
         if not self._is_filled:
             return None

@@ -1,154 +1,83 @@
-# Gerald-SuperBrain .gitignore
+# ═══════════════════════════════════════════════════════════════
+# GEKTOR APEX .gitignore — Institutional Security Perimeter
+# ═══════════════════════════════════════════════════════════════
 
-# Sensitive data
-.openclaw/config.json
+# ─── SECRET SAUCE (PROPRIETARY ALPHA — NEVER COMMIT) ─────────
+secrets/
+alpha_weights.json
+config.yaml
 *.env
 .env.*
-secrets/
+!.env.example
 
-# ChromaDB local data
-memory/chroma/
-gerald-memory/
-
-# Python
+# ─── Python Runtime ──────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyc
 *.egg-info/
 dist/
 build/
 .venv/
 venv/
 
-# Node
-node_modules/
+# ─── SHM / IPC Artifacts ────────────────────────────────────
+*.shm
+*.mmap
 
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Logs (keep structure, ignore content)
-*.log
-
-# Indexer state (generated)
-scripts/.index_state.json
-
-# Bridge temp files
-bridge/inbox/*.md
-bridge/outbox/*.md
-!bridge/inbox/.gitkeep
-!bridge/outbox/.gitkeep
-!bridge/shared-context/.gitkeep
-# Gerald-SuperBrain .gitignore
-
-# Sensitive data
-.openclaw/config.json
-*.env
-.env.*
-secrets/
-
-# ChromaDB local data
-memory/chroma/
-gerald-memory/
-
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-.venv/
-venv/
-
-# Node
-node_modules/
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Logs (keep structure, ignore content)
-*.log
-
-# Indexer state (generated)
-scripts/.index_state.json
-
-# Bridge temp files
-bridge/inbox/*.md
-bridge/outbox/*.md
-!bridge/inbox/.gitkeep
-!bridge/outbox/.gitkeep
-!bridge/shared-context/.gitkeep
-
-# AI Assets & Memory
-models/
-memory/
-gerald_workspace/tmp_run/
-
-# GEKTOR Specific - Institutional Data Leak Block (Side-Channel)
-skills/gerald-sniper/data_run/
-skills/gerald-sniper/emergency_payloads/
-
-# Credentials & Configs
-.env
-secret_settings.json
-
-# Databases & State
+# ─── State & Persistence ────────────────────────────────────
 *.db
 *.sqlite3
 *.db-wal
 *.db-shm
+emergency_dump.jsonl
+emergency_state_dump.jsonl
+failed_alerts.jsonl
+dump.rdb
 /blackbox/
 
-# Alpha & Math (ПРИВАТНЫЙ КОНТУР - НЕ ПУБЛИКОВАТЬ)
-skills/gerald-sniper/core/realtime/math_orchestrator.py
-skills/gerald-sniper/core/realtime/correlator.py
-skills/gerald-sniper/intel_agency/alpha_logic/
+# ─── Node ────────────────────────────────────────────────────
+node_modules/
 
+# ─── OS ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# Logs
+# ─── IDE ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Logs ────────────────────────────────────────────────────
 *.log
 /logs/
 
-# Alpha Artifcats
+# ─── AI & Memory ─────────────────────────────────────────────
+models/
+memory/
+gerald_workspace/tmp_run/
+gerald-memory/
+.openclaw/
+.agent/
+.gemini/
+
+# ─── Bridge Temp ─────────────────────────────────────────────
+bridge/inbox/*.md
+bridge/outbox/*.md
+!bridge/inbox/.gitkeep
+!bridge/outbox/.gitkeep
+!bridge/shared-context/.gitkeep
+
+# ─── Generated Artifacts ─────────────────────────────────────
 reports/
 plots/
 test_results/
 results/
-
-# System specific
-.idea/
-.vscode/
-.env*
-! .env.example
-__pycache__/
-*.pyc
-*.pyo
-
-# GEKTOR v2.0 Persistence Block
-failed_alerts.jsonl
-dump.rdb
 /scratch/
 /artifacts/
 /knowledge/
-.agent/
-.gemini/
-.openclaw/
+scripts/.index_state.json
 
-# GEKTOR APEX SECRET SAUCE
-src/domain/math_core.py
-src/shield/circuit_breaker.py
-config.yaml
+_archive_quarantine/
