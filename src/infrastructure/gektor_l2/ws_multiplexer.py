@@ -202,6 +202,14 @@ class L2OrderBookWebSocketMultiplexer:
     ) -> None:
         st = self._states.setdefault(sym, BookState.SYNCED)
         if st == BookState.RECOVERING:
+            # Буферизуем входящие дельты в Ring Buffer в фоновом режиме во время REST ресинка
+            if msg_type == "delta":
+                bids = parse_bids(first.get("b"))
+                asks = parse_asks(first.get("a"))
+                update_id = int(first.get("u", 0))
+                seq_val = optional_cross_id(first.get("seq"))
+                u_lo = optional_cross_id(first.get("U"))
+                proc.ingest_delta(update_id, bids, asks, range_start=u_lo, seq=seq_val)
             return
         if st == BookState.DESYNCED:
             self._states[sym] = BookState.RECOVERING

@@ -86,3 +86,26 @@ def test_nd_orderbook_seq_monotonic() -> None:
     assert ob.last_reject_reason == "stale_or_duplicate_seq"
     assert ob.is_consistent is True
     assert ob.ingest_delta(13, [], [], seq=101) is True
+
+
+def test_nd_orderbook_ring_buffer_splice() -> None:
+    ob = NdOrderBookStateMachine("BTCUSDT", max_levels=128)
+    
+    # 1. Ingest deltas before snapshot (buffering)
+    assert ob.ingest_delta(11, [(_p(100), 5 * SCALE)], [], range_start=11, seq=1) is False
+    assert ob.last_reject_reason == "no_snapshot_anchor"
+    assert ob._delta_buffer.head == 1
+    assert ob._delta_buffer.tail == 0
+    
+    assert ob.ingest_delta(12, [(_p(101), 6 * SCALE)], [], range_start=12, seq=2) is False
+    assert ob._delta_buffer.head == 2
+    
+    # 2. Ingest snapshot with update_id = 11. It should fast-forward splice and apply delta 12.
+    bids = [(_p(99), 1 * SCALE)]
+    asks = [(_p(102), 3 * SCALE)]
+    ob.ingest_snapshot(11, bids, asks, seq=999)
+    
+    assert ob.last_update_id() == 12
+    assert ob.is_consistent is True
+    assert ob._bid_n == 2  # _p(100) from delta 11 is skipped, but _p(100) from delta 12 should be there
+

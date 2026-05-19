@@ -16,6 +16,81 @@ from src.infrastructure.gektor_l2.constants import SCALE, TAKER_FEE_DENOMINATOR,
 from src.infrastructure.gektor_l2.protocols import AbstractOrderBookProcessor
 
 
+import ctypes
+
+CACHE_LINE_SIZE = 64
+BUFFER_CAPACITY = 65536  # Strictly 2^16
+BUFFER_MASK = BUFFER_CAPACITY - 1
+
+class SHMDeltaLevel(ctypes.Structure):
+    _pack_ = 8
+    _fields_ = [
+        ("price", ctypes.c_int64),
+        ("volume", ctypes.c_int64)
+    ]
+
+class SHMDeltaFrame(ctypes.Structure):
+    _pack_ = 8
+    _fields_ = [
+        ("u_id", ctypes.c_uint64),
+        ("timestamp", ctypes.c_int64),
+        ("range_start", ctypes.c_int64), # -1 if None
+        ("seq", ctypes.c_uint64),        # 0 if None
+        ("bid_count", ctypes.c_uint32),
+        ("ask_count", ctypes.c_uint32),
+        ("bids", SHMDeltaLevel * 50),
+        ("asks", SHMDeltaLevel * 50),
+        ("_pad", ctypes.c_byte * 24)      # Pad to align to 64 bytes
+    ]
+
+class SHMDeltaRingBuffer(ctypes.Structure):
+    """
+    Zero-Copy Ring Buffer aligned to L1 Cache Lines.
+    """
+    _pack_ = CACHE_LINE_SIZE
+    _fields_ = [
+        # Writer cache line
+        ("head", ctypes.c_uint64),
+        ("_pad1", ctypes.c_byte * (CACHE_LINE_SIZE - 8)),
+        
+        # Reader cache line
+        ("tail", ctypes.c_uint64),
+        ("_pad2", ctypes.c_byte * (CACHE_LINE_SIZE - 8)),
+        
+        # Data block
+        ("frames", SHMDeltaFrame * BUFFER_CAPACITY)
+    ]
+
+    def fast_forward_splice(self, snapshot_u_id: int) -> bool:
+        """O(1) or O(N_buffered) check of state splice feasibility"""
+        if self.head == self.tail:
+            return False
+            
+        current_tail_u_id = self.frames[self.tail & BUFFER_MASK].u_id
+        current_head_u_id = self.frames[(self.head - 1) & BUFFER_MASK].u_id
+        
+        if snapshot_u_id < current_tail_u_id:
+            # Snapshot too old, data already dropped by Tail Drop
+            return False
+        if snapshot_u_id > current_head_u_id:
+            # Snapshot from the future, missing data in transit
+            return False
+            
+        # Scan from tail to head to find the frame matching snapshot_u_id
+        curr = self.tail
+        limit = self.head
+        found = False
+        while curr != limit:
+            idx = curr & BUFFER_MASK
+            if self.frames[idx].u_id >= snapshot_u_id:
+                # If we found the exact sync point or the next frame
+                self.tail = curr
+                found = True
+                break
+            curr += 1
+            
+        return found
+
 class NdOrderBookStateMachine(AbstractOrderBookProcessor):
     """
     Fixed-capacity sides; bids stored as ascending `-price` for `np.searchsorted`.
@@ -40,6 +115,7 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         "_ask_p",
         "_ask_q",
         "_ask_n",
+        "_delta_buffer",
     )
 
     def __init__(self, symbol: str, *, max_levels: int = 8192, max_age_ms: float = 2500.0) -> None:
@@ -60,7 +136,9 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         self._ask_p = np.zeros(self._max_levels, dtype=np.int64)
         self._ask_q = np.zeros(self._max_levels, dtype=np.int64)
         self._ask_n: int = 0
-        self._delta_buffer = collections.deque(maxlen=200)
+        self._delta_buffer = SHMDeltaRingBuffer()
+        self._delta_buffer.head = 0
+        self._delta_buffer.tail = 0
 
     @property
     def symbol(self) -> str:
@@ -159,7 +237,8 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         self._last_seq = 0
         self._consistency_ok = False
         self._read_epoch += 1
-        self._delta_buffer.clear()
+        self._delta_buffer.head = 0
+        self._delta_buffer.tail = 0
 
     def ingest_snapshot(
         self,
@@ -191,11 +270,21 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         self._last_update_mono = time.monotonic()
         self._read_epoch += 1
         
-        # [SEQUENCE SYNC] Применяем отложенные дельты, если они новее снапшота
-        while self._delta_buffer:
-            d_u, d_bids, d_asks, d_lo, d_seq = self._delta_buffer.popleft()
+        # [SEQUENCE SYNC] Быстрая склейка дельт через fast_forward_splice
+        # Пытаемся перемотать tail к точке синхронизации снапшота
+        self._delta_buffer.fast_forward_splice(self._u)
+        
+        # Применяем все оставшиеся отложенные дельты, которые новее снапшота
+        while self._delta_buffer.tail != self._delta_buffer.head:
+            frame = self._delta_buffer.frames[self._delta_buffer.tail & BUFFER_MASK]
+            self._delta_buffer.tail += 1
+            
+            d_u = frame.u_id
             if d_u <= self._u:
                 continue
+            
+            d_lo = frame.range_start if frame.range_start != -1 else None
+            d_seq = frame.seq if frame.seq != 0 else None
             
             # Проверка разрыва
             if d_lo is not None and self._u > 0 and d_lo > self._u + 1:
@@ -203,10 +292,10 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
                 self._hard_reset()
                 break
                 
-            for price, qty in d_bids:
-                self._apply_row_bid(int(price), int(qty))
-            for price, qty in d_asks:
-                self._apply_row_ask(int(price), int(qty))
+            for i in range(frame.bid_count):
+                self._apply_row_bid(frame.bids[i].price, frame.bids[i].volume)
+            for i in range(frame.ask_count):
+                self._apply_row_ask(frame.asks[i].price, frame.asks[i].volume)
                 
             self._u = d_u
             if d_seq is not None:
@@ -261,7 +350,30 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
     ) -> bool:
         if self._u == 0:
             # [SEQUENCE SYNC] Буферизация до получения снапшота
-            self._delta_buffer.append((int(update_id), np.copy(bids), np.copy(asks), range_start, seq))
+            head = self._delta_buffer.head
+            tail = self._delta_buffer.tail
+            # Tail Drop: if full, advance tail to overwrite oldest frame
+            if head - tail >= BUFFER_CAPACITY:
+                self._delta_buffer.tail = tail + 1
+            
+            frame = self._delta_buffer.frames[head & BUFFER_MASK]
+            frame.u_id = int(update_id)
+            frame.range_start = int(range_start) if range_start is not None else -1
+            frame.seq = int(seq) if seq is not None else 0
+            
+            bid_count = min(len(bids), 50)
+            frame.bid_count = bid_count
+            for i in range(bid_count):
+                frame.bids[i].price = int(bids[i][0])
+                frame.bids[i].volume = int(bids[i][1])
+                
+            ask_count = min(len(asks), 50)
+            frame.ask_count = ask_count
+            for i in range(ask_count):
+                frame.asks[i].price = int(asks[i][0])
+                frame.asks[i].volume = int(asks[i][1])
+                
+            self._delta_buffer.head = head + 1
             self._last_reject = "no_snapshot_anchor"
             return False
 

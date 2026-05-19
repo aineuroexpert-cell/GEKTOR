@@ -23,6 +23,7 @@ class ExecutionSupervisor:
     def __init__(self, env: str, db_path: str, bar_threshold_usd: Decimal):
         self.env = env
         self.shutdown_event = asyncio.Event()
+        self.should_hot_reload = False
         
         # 1. Инициализация RAM-буферов
         self.bar_queue: asyncio.Queue[DollarBar] = asyncio.Queue() # Внимание: Безлимитная очередь (см. стресс-тест)
@@ -109,6 +110,11 @@ class ExecutionSupervisor:
         logger.warning("[SYSTEM] Получен сигнал прерывания. Инициализация Graceful Shutdown.")
         self.shutdown_event.set()
 
+    def trigger_hot_reload(self) -> None:
+        logger.warning("[SYSTEM] Получен сигнал SIGHUP. Инициирован Hot-Reload...")
+        self.should_hot_reload = True
+        self.shutdown_event.set()
+
 def main() -> NoReturn:
     if sys.platform != "win32":
         try:
@@ -128,6 +134,7 @@ def main() -> NoReturn:
     if sys.platform != "win32":
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, supervisor.trigger_shutdown)
+        loop.add_signal_handler(signal.SIGHUP, supervisor.trigger_hot_reload)
 
     try:
         loop.run_until_complete(supervisor.boot_sequence())
@@ -137,6 +144,9 @@ def main() -> NoReturn:
         loop.run_until_complete(asyncio.sleep(0.1)) 
     finally:
         loop.close()
+        if supervisor.should_hot_reload:
+            import os
+            os.execv(sys.executable, [sys.executable] + sys.argv)
         sys.exit(0)
 
 if __name__ == "__main__":

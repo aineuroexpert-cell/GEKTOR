@@ -453,6 +453,7 @@ class BybitIngestor:
             logger.warning(f"🗑️ [L2] Invalidated {count} cached orderbooks. Fresh snapshots required.")
 
     async def _watchdog_loop(self):
+        # DIAGNOSTIC MODE: Watchdog logs and resets
         """
         [GEKTOR v14.0 PATCH 2] Aggressive Force-Reconnect Watchdog.
         Two independent failure detectors with tightened thresholds:

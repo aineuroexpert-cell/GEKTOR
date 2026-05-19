@@ -164,6 +164,177 @@ if os.path.isdir(venv_path):
     if os.path.isfile(venv_python):
         check("venv/bin/python3 существует", True, critical=False)
 
+
+# Helper Functions for Physical and Network tests
+def _verify_shm_layout() -> bool:
+    import ctypes
+    import time
+    try:
+        sys.path.insert(0, ROOT)
+        from src.infrastructure.shm_layout import SHMOrderBook, SHMLevel
+    except ImportError as e:
+        print(f"     ❌ Не удалось импортировать shm_layout: {e}")
+        return False
+    
+    # 1. Structural checks
+    actual_level_size = ctypes.sizeof(SHMLevel)
+    expected_level_size = 16
+    if actual_level_size != expected_level_size:
+        print(f"     ❌ SHMLevel size mismatch: {actual_level_size} != {expected_level_size}")
+        return False
+        
+    actual_book_size = ctypes.sizeof(SHMOrderBook)
+    expected_book_size = 1624
+    if actual_book_size != expected_book_size:
+        print(f"     ❌ SHMOrderBook size mismatch: {actual_book_size} != {expected_book_size}")
+        return False
+        
+    # Verify offsets
+    epoch_offset = ctypes.offsetof(SHMOrderBook, "epoch")
+    bids_offset = ctypes.offsetof(SHMOrderBook, "bids")
+    asks_offset = ctypes.offsetof(SHMOrderBook, "asks")
+    if epoch_offset != 0 or bids_offset != 24 or asks_offset != 824:
+        print(f"     ❌ SHMOrderBook field offset mismatch (epoch: {epoch_offset}, bids: {bids_offset}, asks: {asks_offset})")
+        return False
+        
+    # 2. Performance benchmark
+    book = SHMOrderBook()
+    mv = memoryview(book)
+    
+    iters = 100_000
+    t0 = time.perf_counter_ns()
+    for _ in range(iters):
+        _ = mv[24]
+    t1 = time.perf_counter_ns()
+    
+    avg_lat_ns = (t1 - t0) / iters
+    print(f"     📊 Средняя задержка чтения SHM: {avg_lat_ns:.2f} ns")
+    if avg_lat_ns > 50.0:
+        print(f"     ❌ Задержка превышает 50ns: {avg_lat_ns:.2f} ns")
+        return False
+    return True
+
+def _verify_ipc_latency() -> bool:
+    import ctypes
+    import mmap
+    import os
+    import time
+    import threading
+    try:
+        sys.path.insert(0, ROOT)
+        from src.infrastructure.ipc import SpinlockMemory
+    except ImportError as e:
+        print(f"     ❌ Не удалось импортировать SpinlockMemory из ipc: {e}")
+        return False
+        
+    mmap_size = 1024 * 1024
+    if sys.platform != "win32":
+        shm_file = "/dev/shm/gektor_preflight_ipc"
+    else:
+        shm_file = "gektor_preflight_ipc.tmp"
+        
+    try:
+        fd = os.open(shm_file, os.O_CREAT | os.O_TRUNC | os.O_RDWR)
+        os.ftruncate(fd, mmap_size)
+        if sys.platform != "win32":
+            buf = mmap.mmap(fd, mmap_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
+        else:
+            buf = mmap.mmap(fd, mmap_size, access=mmap.ACCESS_WRITE)
+    except Exception as e:
+        print(f"     ⚠️ Не удалось создать тестовый mmap сегмент: {e}")
+        return False
+        
+    try:
+        state = SpinlockMemory.from_buffer(buf)
+        state.data_ready = 0
+        state.latest_u_id = 0
+        
+        iterations = 5000
+        
+        def writer_loop():
+            for i in range(iterations):
+                while state.data_ready != 0:
+                    pass
+                state.latest_u_id = i
+                state.data_ready = 1
+                
+        t0 = time.perf_counter()
+        t = threading.Thread(target=writer_loop)
+        t.start()
+        
+        for i in range(iterations):
+            while state.data_ready != 1:
+                pass
+            _ = state.latest_u_id
+            state.data_ready = 0
+            
+        t.join()
+        t1 = time.perf_counter()
+        
+        total_time_us = (t1 - t0) * 1_000_000
+        avg_rtt_us = total_time_us / iterations
+        print(f"     📊 Средний RTT IPC Spinlock: {avg_rtt_us:.2f} мкс (iters: {iterations})")
+        if avg_rtt_us > 10.0:
+            print(f"     ❌ Задержка IPC превышает 10 мкс: {avg_rtt_us:.2f} мкс")
+            return False
+        return True
+    finally:
+        buf.close()
+        os.close(fd)
+        try:
+            os.remove(shm_file)
+        except Exception:
+            pass
+
+def _check_exchange_reachability() -> bool:
+    import socket
+    import ssl
+    import time
+    
+    endpoints = ["api.bybit.com", "stream.bybit.com"]
+    success = True
+    
+    for host in endpoints:
+        try:
+            ip = socket.gethostbyname(host)
+        except socket.gaierror:
+            print(f"     ❌ Ошибка резолва DNS для {host}")
+            return False
+            
+        try:
+            t0 = time.perf_counter()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            sock.connect((host, 443))
+            t_connect = time.perf_counter()
+            tcp_rtt_ms = (t_connect - t0) * 1000
+            
+            context = ssl.create_default_context()
+            tls_sock = context.wrap_socket(sock, server_hostname=host)
+            t_handshake = time.perf_counter()
+            tls_time_ms = (t_handshake - t_connect) * 1000
+            
+            tls_sock.close()
+            sock.close()
+            
+            print(f"     📶 {host} ({ip}): TCP RTT={tcp_rtt_ms:.2f}ms, TLS Handshake={tls_time_ms:.2f}ms")
+            if tcp_rtt_ms > 200.0:
+                print(f"     ⚠️ Внимание: Высокий пинг ({tcp_rtt_ms:.2f}ms)")
+        except Exception as e:
+            print(f"     ❌ Соединение с {host} прервано: {e}")
+            success = False
+    return success
+
+
+# ═══════════════════════════════════════════
+# 7. ФИЗИЧЕСКИЕ И СЕТЕВЫЕ ПРОВЕРКИ HFT
+# ═══════════════════════════════════════════
+print("\n⚡ [7/6] ФИЗИЧЕСКИЕ И СЕТЕВЫЕ ТЕСТЫ HFT")
+check("SHM Layout и латентность чтения < 50нс", _verify_shm_layout())
+check("IPC Spinlock латентность < 10мкс", _verify_ipc_latency())
+check("Bybit Exchange доступность и TLS Handshake", _check_exchange_reachability())
+
+
 # ═══════════════════════════════════════════
 # ИТОГ
 # ═══════════════════════════════════════════

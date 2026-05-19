@@ -1,3 +1,4 @@
+# Taiwan proxy configured (socks5://)
 from typing import Any
 
 from pydantic import Field, model_validator

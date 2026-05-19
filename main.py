@@ -63,6 +63,20 @@ class GektorRadarCore:
         self._loop.stop()
         logger.info("[SYSTEM] Контур безопасно обесточен.")
 
+    async def hot_reload(self) -> None:
+        logger.warning("[SYSTEM] Получен сигнал SIGHUP. Запуск Hot Reload...")
+        self._is_running = False
+        
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        [task.cancel() for task in tasks]
+        
+        logger.info(f"[SYSTEM] Ожидание отмены {len(tasks)} фоновых задач перед hot reload...")
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        logger.info("[SYSTEM] Перезапуск процесса через os.execv...")
+        import os
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
 def main() -> NoReturn:
     # Оптимизация Event Loop (uvloop для Linux-сервера)
     if sys.platform != "win32":
@@ -78,8 +92,14 @@ def main() -> NoReturn:
     core._loop = loop
 
     # Перехват системных сигналов для предотвращения повреждения стейта
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(core.shutdown(s)))
+    if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(core.shutdown(s)))
+        # SIGHUP для атомарной Blue-Green перезагрузки без перезапуска systemd юнита
+        loop.add_signal_handler(signal.SIGHUP, lambda: asyncio.create_task(core.hot_reload()))
+    else:
+        # На Windows перехват сигналов ограничен
+        pass
 
     try:
         loop.run_until_complete(core.startup())

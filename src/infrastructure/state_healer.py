@@ -78,8 +78,9 @@ class LedgerProjection:
                 self.state[symbol]["active_orders"][order_id] = data
 
 class L6StateHealer:
-    def __init__(self, bybit_client, telegram_notifier=None):
+    def __init__(self, bybit_client, outbox_repo=None, telegram_notifier=None):
         self.bybit_client = bybit_client
+        self.outbox_repo = outbox_repo
         self.telegram = telegram_notifier
         self.health = StateHealth.CLEAN
         self.ledger = LedgerProjection()
@@ -110,11 +111,12 @@ class L6StateHealer:
             self.health = StateHealth.CLEAN
             return result
 
-        if result.health == StateHealth.TAINTED_TORN_WRITE:
-            rest_ok = await self._force_smart_epoch_transition(result)
-            if not rest_ok:
-                result.health = StateHealth.SAFE_HOLD
-                await self._enter_safe_hold()
+        # We always want to run the smart epoch transition at startup
+        # to ensure that we synchronize with Bybit and clear outbox phantom orders
+        rest_ok = await self._force_smart_epoch_transition(result)
+        if not rest_ok:
+            result.health = StateHealth.SAFE_HOLD
+            await self._enter_safe_hold()
 
         self.health = result.health
         return result
@@ -130,23 +132,68 @@ class L6StateHealer:
 
         orders_list = open_orders_response.get("result", {}).get("list", [])
         
+        # Pull pending outbox signals to reconcile dispatched intents
+        pending_keys = set()
+        pending_signals = []
+        if self.outbox_repo:
+            try:
+                pending_signals = await self.outbox_repo.get_pending_signals()
+                pending_keys = {sig["idempotency_key"] for sig in pending_signals}
+                logger.info(f"📂 [HEALER] Загружено {len(pending_keys)} отложенных интентов из Outbox.")
+            except Exception as e:
+                logger.error(f"⚠️ [HEALER] Ошибка чтения Outbox: {e}")
+
         zombie_ids_to_purge = []
         survivors_count = 0
         
         for order in orders_list:
             order_id = order.get("orderId")
+            order_link_id = order.get("orderLinkId")
             symbol = order.get("symbol")
             
-            # Cross-Diffing against Ledger
+            is_survivor = False
+            # 1. Check if order is recorded in local memory ledger
             if symbol in self.ledger.state and order_id in self.ledger.state[symbol].get("active_orders", {}):
+                is_survivor = True
+            # 2. Check if order was dispatched but unconfirmed in outbox (e.g. PID 1 died in flight)
+            elif order_link_id and order_link_id in pending_keys:
+                logger.warning(f"🩹 [HEALER] Найден потерянный интент {order_link_id} на бирже. Восстановление...")
+                is_survivor = True
+                
+                # Rehydrate active order in local memory ledger projection
+                if symbol not in self.ledger.state:
+                    self.ledger.state[symbol] = {"position_size": 0.0, "entry_price": 0.0, "active_orders": {}}
+                
+                self.ledger.state[symbol]["active_orders"][order_id] = {
+                    "orderId": order_id,
+                    "orderLinkId": order_link_id,
+                    "symbol": symbol,
+                    "orderStatus": order.get("orderStatus"),
+                    "side": order.get("side"),
+                    "price": float(order.get("price", 0)),
+                    "qty": float(order.get("qty", 0)),
+                    "leavesQty": float(order.get("leavesQty", 0)),
+                    "cumExecQty": float(order.get("cumExecQty", 0))
+                }
+                
+                # Reconcile SQLite status to SENT to prevent double-processing or redundancy
+                if self.outbox_repo:
+                    sig_id = next((sig["id"] for sig in pending_signals if sig["idempotency_key"] == order_link_id), None)
+                    if sig_id is not None:
+                        await self.outbox_repo.mark_as_sent(sig_id)
+                        logger.info(f"💾 [HEALER] Outbox сигнал {order_link_id} помечен как SENT.")
+            
+            if is_survivor:
                 survivors_count += 1
                 self.epoch.active_intents.add(order_id)
-                self.epoch.active_intents.add(order.get("orderLinkId", ""))
+                if order_link_id:
+                    self.epoch.active_intents.add(order_link_id)
                 
                 # Protect against Partial Fill blind spots
                 self.ledger.state[symbol]["active_orders"][order_id]["leavesQty"] = float(order.get("leavesQty", 0))
                 self.ledger.state[symbol]["active_orders"][order_id]["cumExecQty"] = float(order.get("cumExecQty", 0))
             else:
+                # True Zombie order: Exchange has it, but local memory and SQLite know nothing about it. Purge!
                 zombie_ids_to_purge.append({"symbol": symbol, "orderId": order_id})
 
         # Batch-Purge
