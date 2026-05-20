@@ -53,15 +53,24 @@ class OutboxRepository:
         })
 
     async def fetch_pending(self, batch_size: int = 10) -> List[OutboxMessage]:
-        """Чтение с блокировкой для эксклюзивного захвата (FOR UPDATE SKIP LOCKED). Транзакция короткая! (микросекунды)"""
-        query = """
-            SELECT id, payload, priority, status, created_at, execute_after, retry_count 
-            FROM outbox_events 
-            WHERE status = 'PENDING' AND execute_after <= :now
-            ORDER BY priority ASC, created_at ASC
-            LIMIT :limit 
-            FOR UPDATE SKIP LOCKED
-        """
+        is_sqlite = "sqlite" in str(self.db.engine.url)
+        if is_sqlite:
+            query = """
+                SELECT id, payload, priority, status, created_at, execute_after, retry_count 
+                FROM outbox_events 
+                WHERE status = 'PENDING' AND execute_after <= :now
+                ORDER BY priority ASC, created_at ASC
+                LIMIT :limit
+            """
+        else:
+            query = """
+                SELECT id, payload, priority, status, created_at, execute_after, retry_count 
+                FROM outbox_events 
+                WHERE status = 'PENDING' AND execute_after <= :now
+                ORDER BY priority ASC, created_at ASC
+                LIMIT :limit 
+                FOR UPDATE SKIP LOCKED
+            """
         async with self.db.SessionLocal() as session:
             now = datetime.now(timezone.utc)
             result = await session.execute(text(query), {"limit": batch_size, "now": now})
@@ -117,6 +126,9 @@ class TelegramRelayWorker:
     def __init__(self, repo: OutboxRepository, tg_client: INotifier):
         self.repo = repo
         self.tg = tg_client
+        self._running = False
+
+    def stop(self):
         self._running = False
 
     async def run(self):

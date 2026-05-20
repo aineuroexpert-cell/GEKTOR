@@ -137,8 +137,8 @@ def process_ticks_subroutine(symbol: str, batch: List[dict], target_volume: floa
                     "z_score": signal.z_score,
                     "is_anomaly": signal.is_anomaly,
                     "absorption": signal.absorption_detected,
-                    "price": bar.close_price,
-                    "timestamp": bar.end_timestamp
+                    "price": float(bar.close),
+                    "timestamp": float(bar.end_ts)
                 })
 
     # 3. Capture New State

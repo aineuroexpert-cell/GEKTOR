@@ -50,8 +50,9 @@ class SHMDeltaRingBuffer(ctypes.Structure):
     _pack_ = CACHE_LINE_SIZE
     _fields_ = [
         # Writer cache line
+        ("epoch", ctypes.c_uint64),
         ("head", ctypes.c_uint64),
-        ("_pad1", ctypes.c_byte * (CACHE_LINE_SIZE - 8)),
+        ("_pad1", ctypes.c_byte * (CACHE_LINE_SIZE - 16)),
         
         # Reader cache line
         ("tail", ctypes.c_uint64),
@@ -61,35 +62,130 @@ class SHMDeltaRingBuffer(ctypes.Structure):
         ("frames", SHMDeltaFrame * BUFFER_CAPACITY)
     ]
 
-    def fast_forward_splice(self, snapshot_u_id: int) -> bool:
-        """O(1) or O(N_buffered) check of state splice feasibility"""
-        if self.head == self.tail:
-            return False
-            
-        current_tail_u_id = self.frames[self.tail & BUFFER_MASK].u_id
-        current_head_u_id = self.frames[(self.head - 1) & BUFFER_MASK].u_id
+    def write_frame(
+        self,
+        update_id: int,
+        range_start: int | None,
+        seq: int | None,
+        bids: Sequence[tuple[int, int]],
+        asks: Sequence[tuple[int, int]],
+    ) -> None:
+        """
+        Writes a frame using Seqlock protection to ensure consistent multi-process read.
+        """
+        # Increment epoch to odd (write in progress)
+        self.epoch += 1
         
-        if snapshot_u_id < current_tail_u_id:
-            # Snapshot too old, data already dropped by Tail Drop
-            return False
-        if snapshot_u_id > current_head_u_id:
-            # Snapshot from the future, missing data in transit
-            return False
+        head = self.head
+        tail = self.tail
+        # Tail Drop: if full, advance tail to overwrite oldest frame
+        if head - tail >= BUFFER_CAPACITY:
+            self.tail = tail + 1
+        
+        frame = self.frames[head & BUFFER_MASK]
+        frame.u_id = int(update_id)
+        frame.range_start = int(range_start) if range_start is not None else -1
+        frame.seq = int(seq) if seq is not None else 0
+        
+        bid_count = min(len(bids), 50)
+        frame.bid_count = bid_count
+        for i in range(bid_count):
+            frame.bids[i].price = int(bids[i][0])
+            frame.bids[i].volume = int(bids[i][1])
             
-        # Scan from tail to head to find the frame matching snapshot_u_id
-        curr = self.tail
-        limit = self.head
-        found = False
-        while curr != limit:
-            idx = curr & BUFFER_MASK
-            if self.frames[idx].u_id >= snapshot_u_id:
-                # If we found the exact sync point or the next frame
-                self.tail = curr
-                found = True
-                break
-            curr += 1
+        ask_count = min(len(asks), 50)
+        frame.ask_count = ask_count
+        for i in range(ask_count):
+            frame.asks[i].price = int(asks[i][0])
+            frame.asks[i].volume = int(asks[i][1])
             
-        return found
+        self.head = head + 1
+        
+        # Increment epoch to even (write complete)
+        self.epoch += 1
+
+    def read_next_frame(self) -> dict | None:
+        """
+        Reads the next frame using Seqlock protection with userspace spin-retry (~10ns).
+        """
+        while True:
+            seq1 = self.epoch
+            if seq1 & 1:
+                # Writer is in progress, spin-retry (~10ns)
+                continue
+                
+            head = self.head
+            tail = self.tail
+            if tail == head:
+                return None
+                
+            frame = self.frames[tail & BUFFER_MASK]
+            
+            # Read fields
+            d_u = frame.u_id
+            d_lo = frame.range_start
+            d_seq = frame.seq
+            bid_cnt = frame.bid_count
+            ask_cnt = frame.ask_count
+            
+            # Copy nested array data locally before checking epoch
+            bids_data = [(frame.bids[i].price, frame.bids[i].volume) for i in range(bid_cnt)]
+            asks_data = [(frame.asks[i].price, frame.asks[i].volume) for i in range(ask_cnt)]
+            
+            seq2 = self.epoch
+            if seq1 == seq2:
+                # Consistent read complete, advance tail pointer
+                self.tail = tail + 1
+                return {
+                    "u_id": d_u,
+                    "range_start": d_lo if d_lo != -1 else None,
+                    "seq": d_seq if d_seq != 0 else None,
+                    "bids": bids_data,
+                    "asks": asks_data
+                }
+            # Otherwise, torn read. Spin-retry.
+
+    def fast_forward_splice(self, snapshot_u_id: int) -> bool:
+        """O(1) or O(N_buffered) check of state splice feasibility with Seqlock protection"""
+        while True:
+            seq1 = self.epoch
+            if seq1 & 1:
+                continue
+                
+            head = self.head
+            tail = self.tail
+            if head == tail:
+                return False
+                
+            current_tail_u_id = self.frames[tail & BUFFER_MASK].u_id
+            current_head_u_id = self.frames[(head - 1) & BUFFER_MASK].u_id
+            
+            if snapshot_u_id < current_tail_u_id:
+                # Snapshot too old, data already dropped by Tail Drop
+                return False
+            if snapshot_u_id > current_head_u_id:
+                # Snapshot from the future, missing data in transit
+                return False
+                
+            # Scan from tail to head to find the frame matching snapshot_u_id
+            curr = tail
+            limit = head
+            found = False
+            target_tail = tail
+            
+            while curr != limit:
+                idx = curr & BUFFER_MASK
+                if self.frames[idx].u_id >= snapshot_u_id:
+                    target_tail = curr
+                    found = True
+                    break
+                curr += 1
+                
+            seq2 = self.epoch
+            if seq1 == seq2:
+                if found:
+                    self.tail = target_tail
+                return found
 
 class NdOrderBookStateMachine(AbstractOrderBookProcessor):
     """
@@ -142,6 +238,7 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         self._ask_q = np.zeros(self._max_levels, dtype=np.int64)
         self._ask_n: int = 0
         self._delta_buffer = SHMDeltaRingBuffer()
+        self._delta_buffer.epoch = 0
         self._delta_buffer.head = 0
         self._delta_buffer.tail = 0
 
@@ -311,6 +408,7 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         self._last_seq = 0
         self._consistency_ok = False
         self._read_epoch += 1
+        self._delta_buffer.epoch = 0
         self._delta_buffer.head = 0
         self._delta_buffer.tail = 0
 
@@ -349,16 +447,17 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
         self._delta_buffer.fast_forward_splice(self._u)
         
         # Применяем все оставшиеся отложенные дельты, которые новее снапшота
-        while self._delta_buffer.tail != self._delta_buffer.head:
-            frame = self._delta_buffer.frames[self._delta_buffer.tail & BUFFER_MASK]
-            self._delta_buffer.tail += 1
-            
-            d_u = frame.u_id
+        while True:
+            frame_data = self._delta_buffer.read_next_frame()
+            if frame_data is None:
+                break
+                
+            d_u = frame_data["u_id"]
             if d_u <= self._u:
                 continue
             
-            d_lo = frame.range_start if frame.range_start != -1 else None
-            d_seq = frame.seq if frame.seq != 0 else None
+            d_lo = frame_data["range_start"]
+            d_seq = frame_data["seq"]
             
             # Проверка разрыва
             if d_lo is not None and self._u > 0 and d_lo > self._u + 1:
@@ -366,10 +465,10 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
                 self._hard_reset()
                 break
                 
-            for i in range(frame.bid_count):
-                self._apply_row_bid(frame.bids[i].price, frame.bids[i].volume)
-            for i in range(frame.ask_count):
-                self._apply_row_ask(frame.asks[i].price, frame.asks[i].volume)
+            for p, v in frame_data["bids"]:
+                self._apply_row_bid(p, v)
+            for p, v in frame_data["asks"]:
+                self._apply_row_ask(p, v)
                 
             self._u = d_u
             if d_seq is not None:
@@ -427,30 +526,7 @@ class NdOrderBookStateMachine(AbstractOrderBookProcessor):
     ) -> bool:
         if self._u == 0:
             # [SEQUENCE SYNC] Буферизация до получения снапшота
-            head = self._delta_buffer.head
-            tail = self._delta_buffer.tail
-            # Tail Drop: if full, advance tail to overwrite oldest frame
-            if head - tail >= BUFFER_CAPACITY:
-                self._delta_buffer.tail = tail + 1
-            
-            frame = self._delta_buffer.frames[head & BUFFER_MASK]
-            frame.u_id = int(update_id)
-            frame.range_start = int(range_start) if range_start is not None else -1
-            frame.seq = int(seq) if seq is not None else 0
-            
-            bid_count = min(len(bids), 50)
-            frame.bid_count = bid_count
-            for i in range(bid_count):
-                frame.bids[i].price = int(bids[i][0])
-                frame.bids[i].volume = int(bids[i][1])
-                
-            ask_count = min(len(asks), 50)
-            frame.ask_count = ask_count
-            for i in range(ask_count):
-                frame.asks[i].price = int(asks[i][0])
-                frame.asks[i].volume = int(asks[i][1])
-                
-            self._delta_buffer.head = head + 1
+            self._delta_buffer.write_frame(update_id, range_start, seq, bids, asks)
             self._last_reject = "no_snapshot_anchor"
             return False
 
