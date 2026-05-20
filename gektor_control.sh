@@ -34,7 +34,7 @@ case "$ACTION" in
         cd $PROJECT_DIR
         source venv/bin/activate
         echo "Validating Python syntax before ignition..."
-        python -m compileall .
+        python -m compileall -x "venv" .
         echo "Reloading systemd and restarting..."
         systemctl daemon-reload
         systemctl restart $SERVICE_NAME
