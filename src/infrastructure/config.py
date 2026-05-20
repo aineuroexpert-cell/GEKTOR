@@ -76,7 +76,50 @@ class Settings(BaseSettings):
                 "Set required variables in environment or .env before startup."
             )
 
+        import re
+        if self.TG_BOT_TOKEN:
+            token = self.TG_BOT_TOKEN.strip()
+            if not re.match(r"^\d+:[A-Za-z0-9_-]{35,45}$", token):
+                raise ValueError("Invalid Telegram Bot Token signature format.")
+
         return self
+
+    def wipe_sensitive(self) -> None:
+        """
+        [GEKTOR v3.0.0] Wipes sensitive data from memory to prevent leaks.
+        """
+        import ctypes
+        import os
+
+        def zero_string(s: str) -> None:
+            if not isinstance(s, str) or not s:
+                return
+            try:
+                char_code = ord(s[0])
+                offset = None
+                for i in range(16, 128):
+                    val = ctypes.c_ubyte.from_address(id(s) + i).value
+                    if val == char_code:
+                        offset = i
+                        break
+                if offset is not None:
+                    for i in range(len(s)):
+                        ctypes.c_ubyte.from_address(id(s) + offset + i).value = 0
+            except Exception:
+                pass
+
+        # Wipe individual Settings attributes
+        for field in ["BYBIT_API_KEY", "BYBIT_API_SECRET", "TG_BOT_TOKEN"]:
+            val = getattr(self, field, None)
+            if val and isinstance(val, str):
+                zero_string(val)
+                setattr(self, field, "")
+
+        # Purge environment variables
+        for env_var in ["BYBIT_API_KEY", "BYBIT_API_SECRET", "GERALD_BOT_TOKEN", "TELEGRAM_CHAT_ID"]:
+            val = os.environ.pop(env_var, None)
+            if val:
+                zero_string(val)
 
     @property
     def bot_token(self) -> str:

@@ -24,9 +24,10 @@ case "$ACTION" in
         # Уничтожаем старые снапшоты, чтобы исключить Sequence Gap
         rm -f $PROJECT_DIR/artifacts/spillover.jsonl 2>/dev/null || true
         rm -rf $PROJECT_DIR/__pycache__ 2>/dev/null || true
-        # Очистка зомби-памяти Linux (SHM)
+        # Очистка зомби-памяти Linux (SHM) и семафоров/мьютексов
         rm -f /dev/shm/psm_* 2>/dev/null || true
         rm -f /dev/shm/gektor_* 2>/dev/null || true
+        rm -f /dev/shm/sem.gektor_* /dev/shm/sem.psm_* 2>/dev/null || true
         echo -e "\e[32m✅ Clean successful.\e[0m"
         ;;
     "restart")

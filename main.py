@@ -26,6 +26,13 @@ class GektorRadarCore:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.db = DatabaseManager()
         self.tg = TelegramRadarNotifier(db_manager=self.db, bot_token=settings.bot_token, chat_id=settings.chat_id)
+        
+        # [GEKTOR STRIKE] Wiping sensitive data from config/env immediately after TelegramNotifier is initialized
+        settings.wipe_sensitive()
+
+        from src.application.outbox_relay import OutboxRepository, TelegramRelayWorker
+        self.outbox_repo = OutboxRepository(self.db)
+        self.outbox_relay = TelegramRelayWorker(repo=self.outbox_repo, tg_client=self.tg)
 
     async def _alert_engine(self) -> None:
         """
@@ -33,9 +40,12 @@ class GektorRadarCore:
         Гарантирует, что сетевое трение API Telegram не заблокирует ингестию котировок.
         """
         logger.info(f"[ALERT ENGINE] Запущен в среде: {self.env}")
-        while self._is_running:
-            # TODO: Интеграция неблокирующей очереди (asyncio.Queue) или Outbox (SQLite) для алертов
-            await asyncio.sleep(1)
+        try:
+            await self.outbox_relay.run()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[ALERT ENGINE] Сбой Outbox Relay: {e}")
 
     async def _radar_engine(self) -> None:
         """
@@ -50,6 +60,9 @@ class GektorRadarCore:
     async def startup(self) -> None:
         self._is_running = True
         logger.info("[SYSTEM] Инициализация GEKTOR APEX (Advisory Mode)...")
+        
+        # Инициализация DatabaseManager (WAL)
+        await self.db.initialize()
         
         # Инициализация Telegram-нотифиера
         await self.tg.start()
@@ -76,6 +89,9 @@ class GektorRadarCore:
         logger.warning(f"[SYSTEM] Получен сигнал {sig.name}. Начат Graceful Shutdown.")
         self._is_running = False
         
+        # Останавливаем воркер релея
+        self.outbox_relay.stop()
+        
         # Отправка оповещения о завершении
         await self.tg.notify_manual(
             f"🔴 <b>[GEKTOR APEX] Завершение работы</b>\n"
@@ -93,6 +109,7 @@ class GektorRadarCore:
         except Exception:
             pass
         await self.tg.stop()
+        await self.db.close()
         
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         [task.cancel() for task in tasks]
@@ -105,6 +122,9 @@ class GektorRadarCore:
     async def hot_reload(self) -> None:
         logger.warning("[SYSTEM] Получен сигнал SIGHUP. Запуск Hot Reload...")
         self._is_running = False
+        
+        # Останавливаем воркер релея
+        self.outbox_relay.stop()
         
         # Отправка оповещения о горячей перезагрузке
         await self.tg.notify_manual(
@@ -123,6 +143,7 @@ class GektorRadarCore:
         except Exception:
             pass
         await self.tg.stop()
+        await self.db.close()
         
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         [task.cancel() for task in tasks]

@@ -38,6 +38,12 @@ class AlertDebouncer:
 class TelegramRadarNotifier:
     """[GEKTOR v2.0] Institutional Telegram Client with PSR Protocol & Self-Healing Bridge."""
     def __init__(self, db_manager: DatabaseManager, bot_token: str, chat_id: str, event_bus: Any = None, proxy_url: Optional[str] = None):
+        import re
+        if not bot_token:
+            raise ValueError("Telegram Bot Token is empty.")
+        if not re.match(r"^\d+:[A-Za-z0-9_-]{35,45}$", bot_token.strip()):
+            raise ValueError("Invalid Telegram Bot Token signature format.")
+
         self.db = db_manager
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -46,6 +52,31 @@ class TelegramRadarNotifier:
         self.api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         
         logger.info(f"🔑 [Telegram] Token loaded: {bool(self.bot_token)}, Chat ID: {bool(self.chat_id)}, Proxy: {self.proxy_url or 'NONE'}")
+
+        if not self.api_url.startswith("https://"):
+            raise ValueError("Insecure protocol: Telegram API must run over HTTPS.")
+
+        # Zero out sensitive token from memory immediately after initialization
+        import ctypes
+        def zero_string(s: str) -> None:
+            if not isinstance(s, str) or not s:
+                return
+            try:
+                char_code = ord(s[0])
+                offset = None
+                for i in range(16, 128):
+                    val = ctypes.c_ubyte.from_address(id(s) + i).value
+                    if val == char_code:
+                        offset = i
+                        break
+                if offset is not None:
+                    for i in range(len(s)):
+                        ctypes.c_ubyte.from_address(id(s) + offset + i).value = 0
+            except Exception:
+                pass
+
+        zero_string(bot_token)
+        self.bot_token = ""
         
         # [PSR 4.0] TRANSACTIONAL OUTBOX (Persistence > Speed)
         self._wakeup_event = asyncio.Event()
