@@ -2,11 +2,19 @@ import asyncio
 import sys
 import signal
 import logging
+import os
+from decimal import Decimal
 from typing import NoReturn, Optional
 from datetime import datetime, timezone
+
+from src.application.outbox_alert_sink import OutboxAlertSink
+from src.application.radar_pipeline import RadarPipeline
+from src.infrastructure.bybit import BybitRestClient
+from src.infrastructure.bybit_ws_ingestion import BybitWSIngestion
 from src.infrastructure.config import settings
 from src.infrastructure.database import DatabaseManager
 from src.infrastructure.telegram_notifier import TelegramRadarNotifier
+from src.shared.alpha_config import alpha
 
 # Настройка высокопроизводительного логгера
 logging.basicConfig(
@@ -15,6 +23,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("GEKTOR_RADAR")
+
+WS_URL_LINEAR = "wss://stream.bybit.com/v5/public/linear"
+# Cap subscriptions per WS connection to keep below Bybit's per-conn limit.
+MAX_SYMBOLS_PER_WS = 180
+
 
 class GektorRadarCore:
     """
@@ -25,14 +38,34 @@ class GektorRadarCore:
         self._is_running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.db = DatabaseManager()
-        self.tg = TelegramRadarNotifier(db_manager=self.db, bot_token=settings.bot_token, chat_id=settings.chat_id)
-        
+        self.tg = TelegramRadarNotifier(
+            db_manager=self.db,
+            bot_token=settings.bot_token,
+            chat_id=settings.chat_id,
+            proxy_url=settings.TG_PROXY_URL,
+        )
+
         # [GEKTOR STRIKE] Wiping sensitive data from config/env immediately after TelegramNotifier is initialized
         settings.wipe_sensitive()
 
         from src.application.outbox_relay import OutboxRepository, TelegramRelayWorker
         self.outbox_repo = OutboxRepository(self.db)
         self.outbox_relay = TelegramRelayWorker(repo=self.outbox_repo, tg_client=self.tg)
+
+        # --- Quantitative core (v3.6.0 APEX-RADAR) ---
+        self.bybit_rest = BybitRestClient(proxy_url=settings.PROXY_URL if settings.USE_PROXY_FOR_BYBIT else None)
+        threshold_usd_env = float(os.getenv("DOLLAR_THRESHOLD_BASE", "100000"))
+        self.alert_sink = OutboxAlertSink(self.db)
+        self.radar = RadarPipeline(
+            threshold_usd=Decimal(str(threshold_usd_env)),
+            alert_sink=self.alert_sink,
+            window_size=alpha.VPIN_WINDOW_SIZE,
+            z_threshold=alpha.VPIN_ANOMALY_Z if alpha.VPIN_ANOMALY_Z else 2.5,
+            z_history_size=500,
+            per_symbol_cooldown_sec=float(os.getenv("RADAR_COOLDOWN_SEC", "300")),
+        )
+        self._ws_tasks: list[asyncio.Task] = []
+        self._shutdown_event = asyncio.Event()
 
     async def _alert_engine(self) -> None:
         """
@@ -48,14 +81,47 @@ class GektorRadarCore:
             logger.error(f"[ALERT ENGINE] Сбой Outbox Relay: {e}")
 
     async def _radar_engine(self) -> None:
-        """
-        Основной квант-движок. Advisory Mode.
-        Никакой интеграции с REST/WS для отправки ордеров.
+        """Main quant engine — Advisory Mode pipeline (v3.6.0 APEX-RADAR).
+
+        Discovers active USDT-Linear symbols, chunks them across multiple
+        WS connections, and routes each tick through RadarPipeline:
+            Bybit WS → RadarPipeline.process_tick()
+              → DollarBarEngine.process_tick()
+                → on_bar_closed() → O1VPINEngine.process_bar()
+                  → [anomaly?] → OutboxAlertSink → outbox_events row
+                    → TelegramRelayWorker → Telegram
+
+        No order execution. No REST trade API. Advisory only.
         """
         logger.info("[RADAR ENGINE] Поиск среднесрочных аномалий активирован.")
+
+        symbols = await self.bybit_rest.fetch_active_symbols()
+        if not symbols:
+            logger.error("[RADAR ENGINE] Discovery вернул пустой список — радар не запустится.")
+            return
+        logger.info(f"[RADAR ENGINE] Discovery: {len(symbols)} USDT-Linear contracts.")
+
+        # Chunk symbols across WS connections.
+        chunks = [
+            symbols[i : i + MAX_SYMBOLS_PER_WS]
+            for i in range(0, len(symbols), MAX_SYMBOLS_PER_WS)
+        ]
+        logger.info(f"[RADAR ENGINE] Spawning {len(chunks)} WS connection(s).")
+
+        for chunk in chunks:
+            ws = BybitWSIngestion(ws_url=WS_URL_LINEAR, aggregator=self.radar)
+            task = asyncio.create_task(ws.run(chunk, self._shutdown_event))
+            self._ws_tasks.append(task)
+
+        # Status reporter loop (lightweight, no I/O on hot path).
         while self._is_running:
-            # TODO: Zero-Copy маппинг стаканов и каузальное сжатие (Dollar Bars)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(60.0)
+            m = self.radar.metrics()
+            logger.info(
+                f"[RADAR METRICS] ticks={m['tick_count']} bars={m['bar_count']} "
+                f"signals={m['signal_count']} alerts={m['alert_count']} "
+                f"symbols={m['symbols_tracked']}"
+            )
 
     async def startup(self) -> None:
         self._is_running = True
@@ -88,7 +154,12 @@ class GektorRadarCore:
     async def shutdown(self, sig: signal.Signals) -> None:
         logger.warning(f"[SYSTEM] Получен сигнал {sig.name}. Начат Graceful Shutdown.")
         self._is_running = False
-        
+        self._shutdown_event.set()
+
+        # Останавливаем WS-задачи радара
+        for task in self._ws_tasks:
+            task.cancel()
+
         # Останавливаем воркер релея
         self.outbox_relay.stop()
         

@@ -53,43 +53,60 @@ class OutboxRepository:
         })
 
     async def fetch_pending(self, batch_size: int = 10) -> List[OutboxMessage]:
-        """Чтение с блокировкой для эксклюзивного захвата (FOR UPDATE SKIP LOCKED). Транзакция короткая! (микросекунды)"""
-        query = """
-            SELECT id, payload, priority, status, created_at, execute_after, retry_count 
-            FROM outbox_events 
-            WHERE status = 'PENDING' AND execute_after <= :now
-            ORDER BY priority ASC, created_at ASC
-            LIMIT :limit 
-            FOR UPDATE SKIP LOCKED
+        """Claim a batch of pending events atomically.
+
+        Two-step claim that works on BOTH SQLite (no FOR UPDATE) and PostgreSQL:
+            1. SELECT candidate ids.
+            2. UPDATE those ids from 'PENDING' to 'PROCESSING' in a single
+               WHERE id IN (...) AND status = 'PENDING' (status guard
+               prevents a stale claim if another relay raced us).
+            3. Return only the rows we successfully transitioned.
+
+        On SQLite this is safe because the engine serialises writers (WAL
+        single-writer). On PostgreSQL the per-row UPDATE … WHERE status=
+        'PENDING' acts as an optimistic lock without long-held row locks.
         """
         async with self.db.SessionLocal() as session:
             now = datetime.now(timezone.utc)
-            result = await session.execute(text(query), {"limit": batch_size, "now": now})
+            select_query = """
+                SELECT id, payload, priority, status, created_at, execute_after, retry_count
+                FROM outbox_events
+                WHERE status = 'PENDING' AND execute_after <= :now
+                ORDER BY priority ASC, created_at ASC
+                LIMIT :limit
+            """
+            result = await session.execute(
+                text(select_query), {"limit": batch_size, "now": now}
+            )
             rows = result.fetchall()
-            
-            messages = []
-            for r in rows:
-                messages.append(OutboxMessage(
-                    id=r[0],
-                    payload=r[1],
-                    priority=r[2],
-                    status=r[3],
-                    created_at=r[4],
-                    execute_after=r[5],
-                    retry_count=r[6]
-                ))
-            
-            # Since we locked them, let's mark their retry count preemptively or just return 
-            # them within a transaction. But for a relay, usually we return them and the relay updates status afterwards.
-            # However, if we don't commit, the lock is released. We must keep the session open! 
-            # Or instead of SKIP LOCKED + return, we update them to 'PROCESSING'!
-            if rows:
-                ids = tuple([r[0] for r in rows])
-                update_q = "UPDATE outbox_events SET status = 'PROCESSING' WHERE id IN :ids"
-                # For SQLAlchemy list parameter
-                await session.execute(text(update_q), {"ids": ids})
-                await session.commit()
-            
+            if not rows:
+                return []
+
+            ids = [r[0] for r in rows]
+            # Bind each id explicitly so we get portable SQL (no IN :tuple).
+            placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
+            update_query = (
+                f"UPDATE outbox_events SET status = 'PROCESSING' "
+                f"WHERE id IN ({placeholders}) AND status = 'PENDING'"
+            )
+            params = {f"id_{i}": ids[i] for i in range(len(ids))}
+            update_result = await session.execute(text(update_query), params)
+            await session.commit()
+
+            claimed_count = update_result.rowcount or 0
+            messages: List[OutboxMessage] = []
+            for r in rows[:claimed_count]:
+                messages.append(
+                    OutboxMessage(
+                        id=r[0],
+                        payload=r[1],
+                        priority=r[2],
+                        status="PROCESSING",
+                        created_at=r[4],
+                        execute_after=r[5],
+                        retry_count=r[6],
+                    )
+                )
             return messages
 
     async def mark_delivered(self, message_id: int) -> None:

@@ -139,6 +139,27 @@ class RadarPipeline:
         maker (resting order) was a buyer.
         """
         is_buyer_maker = side == "Sell"  # invariant I5
+        await self.process_tick(
+            symbol=symbol,
+            price=price,
+            size=size,
+            is_buyer_maker=is_buyer_maker,
+            exchange_ts=exchange_ts,
+        )
+
+    async def process_tick(
+        self,
+        symbol: str,
+        price: Decimal,
+        size: Decimal,
+        is_buyer_maker: bool,
+        exchange_ts: float,
+    ) -> None:
+        """IBarAggregator protocol entry point used by BybitWSIngestion.
+
+        This is the canonical hot-path called by the ingestor. `on_trade`
+        is a convenience wrapper that accepts the raw Bybit `side` string.
+        """
         self._tick_count += 1
         self._last_tick_ts = exchange_ts
         await self._bar_engine.process_tick(
