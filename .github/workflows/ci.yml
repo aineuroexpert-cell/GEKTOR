@@ -54,11 +54,13 @@ jobs:
 
       - name: Run pytest (radar contour)
         env:
-          # Provide a dummy token to satisfy pydantic-settings validators
-          # in modules that touch settings at import time. The token is
-          # never used by tests (test_ingestor uses mocked WS).
+          # Dummy values to satisfy pydantic-settings validators in modules
+          # that touch settings at import time. Never used by tests
+          # (test_ingestor uses a mocked WS, no real API calls).
           BOT_TOKEN: "0:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
           CHAT_ID: "0"
+          BYBIT_API_KEY: "ci_dummy_key"
+          BYBIT_API_SECRET: "ci_dummy_secret"
           ASYNC_DATABASE_URL: "sqlite+aiosqlite:///:memory:"
         run: |
           python -m pytest tests/ -q --tb=short
