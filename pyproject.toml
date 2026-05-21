@@ -31,6 +31,8 @@ pytest = "7.4.3"
 pytest-asyncio = "0.23.2"
 testcontainers = { version = "3.7.1", extras = ["postgres"] }
 freezegun = "1.2.2"
+hypothesis = "^6.100"
+aiosqlite = "^0.19"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
