@@ -32,7 +32,6 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 from loguru import logger
@@ -150,7 +149,7 @@ class O1VPINEngine:
         self._vpin_sq_sum = float((self._vpin_history**2).sum())
         self._bars_since_rebuild = 0
 
-    def process_bar(self, bar: DollarBar) -> Optional[VPINSignal]:
+    def process_bar(self, bar: DollarBar) -> VPINSignal | None:
         """Ingest a closed dollar bar and emit a VPIN signal (or None during warmup).
 
         Hot path: no imports here, no allocations, O(1) per bar.
@@ -220,8 +219,7 @@ class O1VPINEngine:
         mean_vpin = self._vpin_sum / n
         variance = (self._vpin_sq_sum / n) - (mean_vpin * mean_vpin)
         # Guard against IEEE-754-induced negative variance.
-        if variance < 1e-12:
-            variance = 1e-12
+        variance = max(variance, 1e-12)
         std_dev = math.sqrt(variance)
 
         z_score = float((current_vpin - mean_vpin) / std_dev)

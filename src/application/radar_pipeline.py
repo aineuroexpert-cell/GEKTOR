@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Awaitable, Callable, Optional
 
 from loguru import logger
 
@@ -69,7 +69,7 @@ class _SymbolPerSymbolRateLimiter:
         self._cooldown_sec = cooldown_sec
         self._last_alert: dict[str, float] = {}
 
-    def allow(self, symbol: str, now: Optional[float] = None) -> bool:
+    def allow(self, symbol: str, now: float | None = None) -> bool:
         if now is None:
             now = time.monotonic()
         last = self._last_alert.get(symbol)
@@ -118,7 +118,7 @@ class RadarPipeline:
         self._bar_count: int = 0
         self._signal_count: int = 0
         self._alert_count: int = 0
-        self._last_tick_ts: Optional[float] = None
+        self._last_tick_ts: float | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -209,7 +209,7 @@ class RadarPipeline:
                 f"(window={self._window_size}, z_thresh={self._z_threshold})"
             )
 
-        signal: Optional[VPINSignal] = engine.process_bar(bar)
+        signal: VPINSignal | None = engine.process_bar(bar)
         if signal is None:
             return
 

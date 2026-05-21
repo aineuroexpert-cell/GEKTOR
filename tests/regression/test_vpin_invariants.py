@@ -19,8 +19,7 @@ import numpy as np
 import pytest
 
 from src.domain.conflation import DollarBar
-from src.domain.vpin_engine import O1VPINEngine, VPINSignal
-
+from src.domain.vpin_engine import O1VPINEngine
 
 # ---------------------------------------------------------------------------
 # Helpers

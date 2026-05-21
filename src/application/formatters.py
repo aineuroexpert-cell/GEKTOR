@@ -11,7 +11,6 @@ SECURITY: Never trust raw payload strings. Always escape before embedding in HTM
 from __future__ import annotations
 
 import html
-import time
 from datetime import datetime, timezone
 from typing import Any
 

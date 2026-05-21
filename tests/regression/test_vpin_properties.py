@@ -21,7 +21,6 @@ from __future__ import annotations
 import math
 from decimal import Decimal
 
-import numpy as np
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st

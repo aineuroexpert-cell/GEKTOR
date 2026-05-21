@@ -1,8 +1,9 @@
+import logging
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-import time
-import logging
-from typing import Protocol, Callable, Awaitable
+from typing import Protocol
 
 logger = logging.getLogger("GEKTOR_CONFLATION")
 
@@ -13,14 +14,14 @@ class DollarBar:
     high: Decimal
     low: Decimal
     close: Decimal
-    
+
     # Микроструктурные метрики
     volume_crypto: Decimal = Decimal('0')
     volume_usd: Decimal = Decimal('0')
     buy_volume_usd: Decimal = Decimal('0')
     sell_volume_usd: Decimal = Decimal('0')
     tick_count: int = 0
-    
+
     # Временные метки биржи (Exchange Time)
     start_ts: float = field(default_factory=time.time)
     end_ts: float = 0.0
@@ -40,14 +41,21 @@ class DollarBar:
 
 
 class IBarAggregator(Protocol):
-    async def process_tick(self, symbol: str, price: Decimal, size: Decimal, is_buyer_maker: bool, exchange_ts: float) -> None:
+    async def process_tick(
+        self,
+        symbol: str,
+        price: Decimal,
+        size: Decimal,
+        is_buyer_maker: bool,
+        exchange_ts: float,
+    ) -> None:
         """Агрегирует входящий тик. Если порог достигнут — закрывает бар."""
         ...
 
     def set_callback(self, callback: Callable[[DollarBar], Awaitable[None]]) -> None:
         """Регистрация асинхронного коллбэка для передачи закрытого бара в квант-движок."""
         ...
-        
+
     async def handle_resync(self) -> None:
         """Аварийный сброс разорванного стейта при реконнекте сети."""
         ...
@@ -79,7 +87,7 @@ class DollarBarEngine(IBarAggregator):
         self, symbol: str, price: Decimal, size: Decimal, is_buyer_maker: bool, exchange_ts: float
     ) -> None:
         tick_usd = price * size
-        
+
         # Получаем или инициализируем новый аккумулятор для тикера
         bar = self._current_bars.get(symbol)
         if not bar:
@@ -89,8 +97,8 @@ class DollarBarEngine(IBarAggregator):
             self._current_bars[symbol] = bar
 
         # Обновление экстремумов и цены закрытия
-        if price > bar.high: bar.high = price
-        if price < bar.low: bar.low = price
+        bar.high = max(bar.high, price)
+        bar.low = min(bar.low, price)
         bar.close = price
 
         # Обновление микроструктуры
@@ -108,10 +116,10 @@ class DollarBarEngine(IBarAggregator):
         # Каузальный триггер: порог долларов превышен
         if bar.volume_usd >= self.threshold_usd:
             bar.end_ts = exchange_ts
-            
+
             # 1. Извлекаем готовый бар
             closed_bar = self._current_bars.pop(symbol)
-            
+
             # 2. Немедленно передаем в квант-движок
             if self._on_bar_closed:
                 try:

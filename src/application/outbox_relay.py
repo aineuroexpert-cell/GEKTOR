@@ -1,9 +1,10 @@
 import asyncio
-import logging
 import json
-from typing import List, Optional, Protocol, Any
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Any, Protocol
+
 from sqlalchemy import text
 
 logger = logging.getLogger("GEKTOR.Outbox")
@@ -52,7 +53,7 @@ class OutboxRepository:
             "now": now
         })
 
-    async def fetch_pending(self, batch_size: int = 10) -> List[OutboxMessage]:
+    async def fetch_pending(self, batch_size: int = 10) -> list[OutboxMessage]:
         """Claim a batch of pending events atomically.
 
         Two-step claim that works on BOTH SQLite (no FOR UPDATE) and PostgreSQL:
@@ -94,7 +95,7 @@ class OutboxRepository:
             await session.commit()
 
             claimed_count = update_result.rowcount or 0
-            messages: List[OutboxMessage] = []
+            messages: list[OutboxMessage] = []
             for r in rows[:claimed_count]:
                 messages.append(
                     OutboxMessage(
@@ -140,12 +141,13 @@ class TelegramRelayWorker:
         self._running = True
         logger.info("📡 [RELAY] Outbox Worker Started.")
         while self._running:
-            # Transactions are executed fully internally in `fetch_pending` and locks released immediately upon SET PROCESSING
+            # Transactions execute fully inside fetch_pending; PROCESSING claim
+            # releases the row lock immediately so other workers can poll too.
             messages = await self.repo.fetch_pending(batch_size=5)
             if not messages:
                 await asyncio.sleep(0.5) # Fallback polling
                 continue
-            
+
             for msg in messages:
                 try:
                     payload = self._decode_payload(msg.payload)
