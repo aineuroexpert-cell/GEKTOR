@@ -95,9 +95,15 @@ def test_realtime_dollar_bar_generator():
 def test_o1_vpin_engine():
     """
     Tests VPIN signal calculation and absorption (iceberg) detection.
+
+    Note: After the v3.6.0 fix (invariant I3 in vpin_engine.py), the very
+    first emitted VPIN cannot be an anomaly — the Z-Score divisor is
+    _z_count=1, so mean==vpin and z=0 by construction. The previous test
+    asserted is_anomaly=True on the first signal, which depended on the
+    BUG that divided variance by window_size during warmup.
     """
-    engine = O1VPINEngine(window_size=2, volume_threshold=1000.0, z_threshold=1.0)
-    
+    engine = O1VPINEngine(window_size=2, volume_threshold=1000.0, z_threshold=1.0, z_history_size=2)
+
     # Create dollar bars
     bar1 = DollarBar(
         symbol="BTCUSDT", open=Decimal('100.0'), high=Decimal('105.0'),
@@ -106,7 +112,7 @@ def test_o1_vpin_engine():
         volume_usd=Decimal('1000.0'), volume_crypto=Decimal('10.0')
     )
     # Imbalance: 800 - 200 = 600
-    
+
     bar2 = DollarBar(
         symbol="BTCUSDT", open=Decimal('102.0'), high=Decimal('103.0'),
         low=Decimal('98.0'), close=Decimal('99.0'),
@@ -114,21 +120,27 @@ def test_o1_vpin_engine():
         volume_usd=Decimal('1000.0'), volume_crypto=Decimal('10.0')
     )
     # Imbalance: abs(100 - 900) = 800
-    
+
     res1 = engine.process_bar(bar1)
-    assert res1 is None # Window size is 2, need 2 bars to fill
-    
+    assert res1 is None  # Window size is 2, need 2 bars to fill
+
     res2 = engine.process_bar(bar2)
     assert res2 is not None
-    # Running imbalance sum = 600 + 800 = 1400
-    # Total volume = 1000 * 2 = 2000
-    # VPIN = 1400 / 2000 = 0.7
+    # Running imbalance sum = 600 + 800 = 1400; total volume = 1000 * 2 = 2000.
     assert res2.vpin_value == pytest.approx(0.7)
-    
-    # Z-Score tracking
-    # History contains vpin=0.7. Mean=0.7, std=1e-9.
-    # Anomaly since std is tiny and Z-Score > z_threshold
-    assert res2.is_anomaly is True
+    # First emitted signal: z_count=1, mean==vpin, z=0. Not an anomaly.
+    assert res2.is_anomaly is False
+
+    # A third bar with a different VPIN gives us z_count=2 and a meaningful sigma.
+    bar3 = DollarBar(
+        symbol="BTCUSDT", open=Decimal('99.0'), high=Decimal('100.0'),
+        low=Decimal('98.0'), close=Decimal('99.0'),
+        buy_volume_usd=Decimal('500.0'), sell_volume_usd=Decimal('500.0'),
+        volume_usd=Decimal('1000.0'), volume_crypto=Decimal('10.0')
+    )
+    res3 = engine.process_bar(bar3)
+    assert res3 is not None
+    assert math.isfinite(res3.z_score)
 
 def test_o1_welford_cusum():
     """

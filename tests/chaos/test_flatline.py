@@ -1,4 +1,10 @@
 import pytest
+
+# Sentinel imports the infrastructure DatabaseManager which transitively imports
+# redis.asyncio. The Advisory radar (v3.6.0 APEX-RADAR) does not require Redis,
+# so we skip this entire chaos suite cleanly if the redis package is missing.
+pytest.importorskip("redis", reason="redis not installed; sentinel chaos tests deferred")
+
 import time
 from src.application.sentinel import FlatlineSentinel
 

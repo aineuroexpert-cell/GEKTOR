@@ -2,12 +2,18 @@ import asyncio
 import os
 import sys
 
+import pytest
+
+# Skill retrieval depends on the LLM / Vector-DB / Redis stack \u2014 entirely
+# outside the Advisory radar contour (v3.6.0 APEX-RADAR). Skip when deps
+# are unavailable.
+pytest.importorskip("redis", reason="redis not installed; skill retrieval tests deferred")
+
 # Fix path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.infrastructure.database.vector_db import VectorDatabase
 from src.infrastructure.llm.reranker import Reranker
-import pytest
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,11 @@ class DollarBar:
     start_ts: float = field(default_factory=time.time)
     end_ts: float = 0.0
 
+    # Optional OFI accumulator used by RealtimeDollarBarGenerator (dollar_bar.py).
+    # Not used by DollarBarEngine / RadarPipeline. Kept on the dataclass so that
+    # slots=True does not break the alternative generator.
+    ofi_accum: Decimal = Decimal("0")
+
     @property
     def order_flow_imbalance(self) -> Decimal:
         """

@@ -4,7 +4,14 @@ import unittest
 import warnings
 from datetime import datetime
 
+import pytest
+
 warnings.simplefilter(action='ignore', category=DeprecationWarning)
+
+# This test suite belongs to the deferred Agent/LLM "Architect" contour and
+# depends on lancedb / GPU monitoring \u2014 neither of which is required by the
+# Advisory radar (v3.6.0 APEX-RADAR). Skip when deps are missing.
+pytest.importorskip("lancedb", reason="lancedb not installed; architect tests deferred")
 
 # Add src to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))

@@ -1,9 +1,12 @@
 import asyncio
 import os
 import sys
-import chromadb
 
 import pytest
+
+# ChromaDB is part of the LLM/RAG infrastructure, NOT the Advisory radar.
+# Skip cleanly when the package is unavailable.
+chromadb = pytest.importorskip("chromadb", reason="chromadb not installed; RAG tests deferred")
 
 # Fix path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
