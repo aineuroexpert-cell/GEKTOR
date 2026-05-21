@@ -44,26 +44,45 @@
 
 ### 1. Requirements
 - Python 3.11+
-- PostgreSQL (TimescaleDB)
-- Redis 7.0+
-- Bybit V5 API Credentials
+- PostgreSQL (TimescaleDB) **or** SQLite (default for local dev — fully supported)
+- Redis 7.0+ (optional; used by `ReliableIngestionBuffer`, falls back to disk spillover)
+- Bybit V5 API access (public WS is enough for the radar; no trade API required)
 
 ### 2. Deployment
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+make install
 
-# Run Pre-Flight Validation
-python pre_flight.py
+# Configure
+cp .env.example .env       # then edit BOT_TOKEN, CHAT_ID, etc.
 
-# Start APEX Engine
-python main.py
+# Start APEX Radar (Advisory Mode)
+make run-local
 ```
 
 ### 3. Monitoring
-- Institutional-grade alerts are dispatched via **Telegram Broadcaster**.
-- Real-time performance tracking is stored in the `signals` table for post-trade analysis.
+- Alerts are dispatched via **TelegramRadarNotifier** through the
+  transactional outbox (`outbox_events` table). The outbox SQL works
+  on both SQLite and PostgreSQL.
+- A **PartialBlindnessWatchdog** raises a Telegram alert if no ticks
+  arrive for `WATCHDOG_SILENCE_SEC` (default 60s).
+- Status logs at INFO every 60s: `ticks bars signals alerts symbols`.
+
+### 4. Tests
+```bash
+make test           # full suite (expected: 68 passed, 8 skipped)
+make test-radar     # regression suite only (fast)
+make test-vpin      # VPIN invariants + Hypothesis property tests
+make test-pipeline  # ingestor -> radar end-to-end
+```
+
+### 5. Hardened in v3.6.0 APEX-RADAR
+See [SINGLE_SOURCE_OF_TRUTH.md](./SINGLE_SOURCE_OF_TRUTH.md) for the
+canonical architecture manifesto. Test sentinels guard invariants
+I1–I5, time-decay consistency, IEEE-754 drift, polarity contract.
+AI agents must read [AGENTS.md](./AGENTS.md) before modifying any
+file in this repository.
 
 ---
 
-_Created: 2026-04-04 | Project: GEKTOR v12.0 (APEX) | Status: HARDENED_
+_Created: 2026-04-04 | Updated: 2025-05-21 v3.6.0 APEX-RADAR | Status: HARDENED_
