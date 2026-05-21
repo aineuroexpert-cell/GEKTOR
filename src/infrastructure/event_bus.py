@@ -228,8 +228,12 @@ class EventBus:
             if event_name in self._subscribers:
                 handlers = [cb(event) for cb in self._subscribers[event_name]]
                 if handlers:
-                    # Ждем, пока Telegram и другие сервисы обработают событие
-                    await asyncio.gather(*handlers, return_exceptions=False)
+                    # [GEKTOR v3.0.0] return_exceptions=True prevents cascading failure:
+                    # If Telegram handler crashes, Outbox acknowledgment still proceeds.
+                    results = await asyncio.gather(*handlers, return_exceptions=True)
+                    for i, r in enumerate(results):
+                        if isinstance(r, Exception):
+                            logger.error(f"💥 [EventBus] Handler #{i} for {event_name} failed: {type(r).__name__}: {r}")
             
             # [OUTBOX ACKNOWLEDGEMENT] Событие доставлено, помечаем в базе
             outbox_id = getattr(event, "_outbox_id", None)

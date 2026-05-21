@@ -23,17 +23,20 @@ class O1VPINEngine:
     __slots__ = [
         'window_size', 'volume_threshold', '_imbalances', '_index', '_is_filled',
         '_running_imbalance_sum', '_vpin_history', '_vpin_sum', '_vpin_sq_sum', 
-        '_anomaly_threshold_z', '_price_history', '_last_update_time'
+        '_anomaly_threshold_z', '_price_history', '_last_update_time',
+        '_z_history_size', '_z_index', '_z_count'
     ]
 
-    def __init__(self, window_size: int = 50, volume_threshold: float = 1_000_000.0, z_threshold: float = 2.5):
+    def __init__(self, window_size: int = 50, volume_threshold: float = 1_000_000.0,
+                 z_threshold: float = 2.5, z_history_size: int = 500):
         self.window_size = window_size
         self.volume_threshold = volume_threshold
         self._anomaly_threshold_z = z_threshold
+        self._z_history_size = z_history_size
         
         # [PRE-ALLOCATION] Zero-Copy Infrastructure
         self._imbalances = np.zeros(window_size, dtype=np.float64)
-        self._vpin_history = np.zeros(window_size, dtype=np.float64)
+        self._vpin_history = np.zeros(z_history_size, dtype=np.float64)
         self._price_history = np.zeros(window_size, dtype=np.float64)
         
         self.reset_o1()
@@ -45,10 +48,11 @@ class O1VPINEngine:
         self._running_imbalance_sum = 0.0
         self._vpin_sum = 0.0
         self._vpin_sq_sum = 0.0
+        self._z_index = 0
+        self._z_count = 0
         # NumPy arrays are reused; pointers are simply reset.
 
     def process_bar(self, bar: DollarBar) -> Optional[VPINSignal]:
-        import time
         buy_vol = float(bar.buy_volume_usd)
         sell_vol = float(bar.sell_volume_usd)
         price = float(bar.close)
@@ -96,14 +100,22 @@ class O1VPINEngine:
         current_vpin = self._running_imbalance_sum / total_volume
 
         # O(1) Обновление статистики для Z-Score
-        old_vpin = self._vpin_history[current_idx]
+        z_idx = self._z_index
+        old_vpin = self._vpin_history[z_idx]
         self._vpin_sum += (current_vpin - old_vpin)
         self._vpin_sq_sum += (current_vpin**2 - old_vpin**2)
-        self._vpin_history[current_idx] = current_vpin
-
+        self._vpin_history[z_idx] = current_vpin
+        
+        self._z_index += 1
+        if self._z_index >= self._z_history_size:
+            self._z_index = 0
+        if self._z_count < self._z_history_size:
+            self._z_count += 1
+        
         # Математика Z-Score (Welford-подобная аппроксимация окна)
-        mean_vpin = self._vpin_sum / self.window_size
-        variance = (self._vpin_sq_sum / self.window_size) - (mean_vpin**2)
+        n = self._z_count if self._z_count > 0 else 1   # защита от деления на 0
+        mean_vpin = self._vpin_sum / n
+        variance = (self._vpin_sq_sum / n) - (mean_vpin**2)
         std_dev = math.sqrt(variance) if variance > 1e-9 else 1e-9
         
         z_score = (current_vpin - mean_vpin) / std_dev
@@ -111,8 +123,10 @@ class O1VPINEngine:
 
         # [STRUCTURAL FILTER - ICEBERG VERIFICATION]
         # Проверяем, сдвинулась ли цена в сторону дисбаланса.
-        # Цена начала окна: self._price_history[self._index] (т.к. self._index уже сдвинулся на самый старый бар)
-        price_start_window = self._price_history[self._index]
+        oldest_idx = self._index  # после инкремента self._index = следующий слот = самый старый
+        price_start_window = self._price_history[oldest_idx]
+        # oldest_idx: after increment, self._index points to the slot about to be overwritten next,
+        # which is the OLDEST element in the ring buffer. This is correct for window-start price.
         price_return = price - price_start_window
         
         # Если дисбаланс лонговый (buy_vol > sell_vol), но price_return <= 0 -> Absorption (Iceberg)

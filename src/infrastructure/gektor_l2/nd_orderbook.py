@@ -104,11 +104,14 @@ class SHMDeltaRingBuffer(ctypes.Structure):
         # Increment epoch to even (write complete)
         self.epoch += 1
 
+    _MAX_SPIN: int = 1000  # ~10μs on modern x86 at 10ns/spin
+
     def read_next_frame(self) -> dict | None:
         """
-        Reads the next frame using Seqlock protection with userspace spin-retry (~10ns).
+        Reads the next frame using Seqlock protection with bounded userspace spin-retry.
+        Returns None if buffer empty OR spin budget exhausted (writer stall).
         """
-        while True:
+        for _ in range(self._MAX_SPIN):
             seq1 = self.epoch
             if seq1 & 1:
                 # Writer is in progress, spin-retry (~10ns)
@@ -144,10 +147,12 @@ class SHMDeltaRingBuffer(ctypes.Structure):
                     "asks": asks_data
                 }
             # Otherwise, torn read. Spin-retry.
+        # Spin budget exhausted — writer stall or extreme contention
+        return None
 
     def fast_forward_splice(self, snapshot_u_id: int) -> bool:
-        """O(1) or O(N_buffered) check of state splice feasibility with Seqlock protection"""
-        while True:
+        """O(1) or O(N_buffered) check of state splice feasibility with bounded Seqlock protection"""
+        for _ in range(self._MAX_SPIN):
             seq1 = self.epoch
             if seq1 & 1:
                 continue
@@ -186,6 +191,8 @@ class SHMDeltaRingBuffer(ctypes.Structure):
                 if found:
                     self.tail = target_tail
                 return found
+        # Spin budget exhausted
+        return False
 
 class NdOrderBookStateMachine(AbstractOrderBookProcessor):
     """

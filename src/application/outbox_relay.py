@@ -93,10 +93,11 @@ class OutboxRepository:
             # However, if we don't commit, the lock is released. We must keep the session open! 
             # Or instead of SKIP LOCKED + return, we update them to 'PROCESSING'!
             if rows:
-                ids = tuple([r[0] for r in rows])
-                update_q = "UPDATE outbox_events SET status = 'PROCESSING' WHERE id IN :ids"
-                # For SQLAlchemy list parameter
-                await session.execute(text(update_q), {"ids": ids})
+                ids = [r[0] for r in rows]
+                placeholders = ", ".join([f":id_{i}" for i in range(len(ids))])
+                update_q = f"UPDATE outbox_events SET status = 'PROCESSING' WHERE id IN ({placeholders})"
+                params = {f"id_{i}": id_val for i, id_val in enumerate(ids)}
+                await session.execute(text(update_q), params)
                 await session.commit()
             
             return messages
@@ -170,5 +171,3 @@ class TelegramRelayWorker:
             pass
         return {"event_type": "RAW_TEXT", "symbol": "GLOBAL", "reason": "", "fact": raw_payload, "limit": ""}
 
-    def stop(self):
-        self._running = False

@@ -270,12 +270,16 @@ class GektorOrchestrator:
             blind_symbols = self.flatline_sentinel.check_for_flatlines(self.symbols)
             if blind_symbols:
                 for symbol in blind_symbols:
-                    asyncio.create_task(self.tg.notify_manual(f"🛑 <b>[ЧАСТИЧНАЯ СЛЕПОТА]</b> Поток данных {symbol} остановлен (Exchange Freeze)."))
+                    _t = asyncio.create_task(self.tg.notify_manual(f"🛑 <b>[ЧАСТИЧНАЯ СЛЕПОТА]</b> Поток данных {symbol} остановлен (Exchange Freeze)."))
+                    self._background_tasks.add(_t)
+                    _t.add_done_callback(self._background_tasks.discard)
 
     def send_critical_alert(self, message: str):
         """Callback for ingestor to report critical network/API failures."""
         logger.error(f"🚨 [INGESTOR] {message}")
-        asyncio.create_task(self.tg.notify_manual(f"🚨 <b>[СБОЙ ИНФРАСТРУКТУРЫ]</b>\n{message}"))
+        _t = asyncio.create_task(self.tg.notify_manual(f"🚨 <b>[СБОЙ ИНФРАСТРУКТУРЫ]</b>\n{message}"))
+        self._background_tasks.add(_t)
+        _t.add_done_callback(self._background_tasks.discard)
 
     async def start(self):
         """[GEKTOR v14.0] Ignite all core infrastructure with Zombie Signal Exorcism."""

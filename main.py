@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from src.infrastructure.config import settings
 from src.infrastructure.database import DatabaseManager
 from src.infrastructure.telegram_notifier import TelegramRadarNotifier
+from src.shared.alpha_config import alpha
 
 # Настройка высокопроизводительного логгера
 logging.basicConfig(
@@ -26,9 +27,6 @@ class GektorRadarCore:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.db = DatabaseManager()
         self.tg = TelegramRadarNotifier(db_manager=self.db, bot_token=settings.bot_token, chat_id=settings.chat_id)
-        
-        # [GEKTOR STRIKE] Wiping sensitive data from config/env immediately after TelegramNotifier is initialized
-        settings.wipe_sensitive()
 
         from src.application.outbox_relay import OutboxRepository, TelegramRelayWorker
         self.outbox_repo = OutboxRepository(self.db)
@@ -49,13 +47,115 @@ class GektorRadarCore:
 
     async def _radar_engine(self) -> None:
         """
-        Основной квант-движок. Advisory Mode.
-        Никакой интеграции с REST/WS для отправки ордеров.
+        [GEKTOR v3.0.0] Predator Radar — Mid-Term Anomaly Scanner.
+
+        Full pipeline:
+          1. Discover ALL USDT-Linear futures via Bybit REST API
+          2. Subscribe to publicTrade WS streams for all symbols
+          3. Route every trade through RadarPipeline:
+             Trade → Dollar Bar → VPIN → Anomaly → Telegram Alert
+
+        Runs indefinitely. Auto-refreshes symbol list every 6 hours.
         """
-        logger.info("[RADAR ENGINE] Поиск среднесрочных аномалий активирован.")
-        while self._is_running:
-            # TODO: Zero-Copy маппинг стаканов и каузальное сжатие (Dollar Bars)
-            await asyncio.sleep(0.1)
+        from src.application.radar_pipeline import RadarPipeline
+        from src.infrastructure.bybit import BybitRestClient, BybitIngestor
+
+        logger.info("[RADAR ENGINE] Инициализация хищного радара...")
+
+        # REST client for symbol discovery (no auth needed for public endpoints)
+        rest = BybitRestClient(
+            proxy_url=settings.TG_PROXY_URL if settings.USE_PROXY_FOR_BYBIT else None
+        )
+
+        # Create radar pipeline
+        pipeline = RadarPipeline(
+            tg_notify_callback=self.tg.notify_manual,
+            db_push_callback=self.db.push_query,
+            dollar_threshold_usd=float(settings.DOLLAR_THRESHOLD_BASE),
+            vpin_window=alpha.VPIN_WINDOW_SIZE if alpha.VPIN_WINDOW_SIZE > 0 else 50,
+            vpin_z_threshold=alpha.VPIN_ANOMALY_Z if alpha.VPIN_ANOMALY_Z > 0 else 2.5,
+            alert_cooldown_sec=alpha.SIGNAL_COOLDOWN_SEC if alpha.SIGNAL_COOLDOWN_SEC > 0 else 300.0,
+        )
+        pipeline.start()
+
+        # Discover symbols
+        try:
+            all_symbols = await rest.fetch_active_symbols()
+            if not all_symbols:
+                all_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+                logger.warning(f"[RADAR] Discovery failed. Fallback: {all_symbols}")
+        except Exception as e:
+            all_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+            logger.error(f"[RADAR] REST discovery error: {e}. Fallback: {all_symbols}")
+
+        logger.success(f"[RADAR] 📡 Обнаружено {len(all_symbols)} фьючерсов. Подключаю ленту сделок...")
+
+        # Trade callback wired to pipeline
+        async def on_trade(symbol: str, tick: dict) -> None:
+            await pipeline.on_trade(symbol, tick)
+
+        async def on_snapshot(symbol: str, data: dict) -> None:
+            pass  # L2 not needed for Advisory VPIN radar
+
+        def on_critical_alert(msg: str) -> None:
+            logger.error(f"🚨 [INGESTOR] {msg}")
+
+        # Create WS ingestor for ALL symbols
+        ingestor = BybitIngestor(
+            symbols=all_symbols,
+            on_tick_callback=on_trade,
+            on_snapshot_callback=on_snapshot,
+            alert_callback=on_critical_alert,
+            proxy_url=settings.TG_PROXY_URL if settings.USE_PROXY_FOR_BYBIT else None,
+        )
+
+        # Send startup confirmation with symbol count
+        await self.tg.notify_manual(
+            f"🎯 <b>[RADAR] Хищник вышел на охоту</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 Фьючерсов: <code>{len(all_symbols)}</code>\n"
+            f"💰 Порог бара: <code>${float(settings.DOLLAR_THRESHOLD_BASE):,.0f}</code>\n"
+            f"🧬 VPIN окно: <code>{pipeline._vpin_window}</code>\n"
+            f"⚡ Z-порог: <code>{pipeline._vpin_z_threshold}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ <b>СКАНИРОВАНИЕ АКТИВНО</b>",
+            "STARTUP"
+        )
+
+        # Health report task
+        async def _health_report_loop():
+            while self._is_running:
+                await asyncio.sleep(1800)  # Every 30 minutes
+                try:
+                    stats = await pipeline.get_stats()
+                    await self.tg.notify_manual(
+                        f"📊 <b>[RADAR] Статус</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📡 Символов: <code>{stats['symbols_tracked']}</code>\n"
+                        f"🔢 Тиков: <code>{stats['total_ticks']:,}</code>\n"
+                        f"📦 Баров: <code>{stats['total_bars_closed']:,}</code>\n"
+                        f"🎯 Аномалий: <code>{stats['total_anomalies']}</code>\n"
+                        f"⚡ Тиков/сек: <code>{stats['ticks_per_sec']}</code>\n"
+                        f"⏱ Аптайм: <code>{stats['uptime_hours']}h</code>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━",
+                        "HEALTH"
+                    )
+                except Exception as e:
+                    logger.error(f"[RADAR] Health report error: {e}")
+
+        # Launch health reporter as background task
+        health_task = asyncio.create_task(_health_report_loop())
+
+        try:
+            # Run ingestor (blocks until shutdown)
+            await ingestor.start()
+        except asyncio.CancelledError:
+            logger.info("[RADAR] Radar engine cancelled.")
+        finally:
+            health_task.cancel()
+            await ingestor.stop()
+            await rest.close()
+            logger.info("[RADAR] Radar engine stopped.")
 
     async def startup(self) -> None:
         self._is_running = True
@@ -66,6 +166,15 @@ class GektorRadarCore:
         
         # Инициализация Telegram-нотифиера
         await self.tg.start()
+        
+        # [GEKTOR STRIKE] Delayed secret wiping to resolve Race Condition (J).
+        # Gives background tasks (WS ingestor/rest client) 5 seconds to boot up and read settings.
+        async def delayed_wipe():
+            await asyncio.sleep(5.0)
+            settings.wipe_sensitive()
+            logger.info("🔒 [SECURITY] Sensitive credentials physically wiped from memory.")
+        
+        asyncio.create_task(delayed_wipe())
         
         # Отправка стартового оповещения
         await self.tg.notify_manual(
@@ -105,9 +214,10 @@ class GektorRadarCore:
         
         # Ожидаем завершения отправки алертов из очереди
         try:
-            await asyncio.timeout(3.0, self.tg._queue.join())
-        except Exception:
-            pass
+            async with asyncio.timeout(3.0):
+                await self.tg._queue.join()
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("[SYSTEM] Telegram queue drain timeout (3s). Force stopping.")
         await self.tg.stop()
         await self.db.close()
         
@@ -139,9 +249,10 @@ class GektorRadarCore:
         
         # Ожидаем завершения отправки алертов из очереди
         try:
-            await asyncio.timeout(3.0, self.tg._queue.join())
-        except Exception:
-            pass
+            async with asyncio.timeout(3.0):
+                await self.tg._queue.join()
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("[SYSTEM] Telegram queue drain timeout (3s). Force stopping.")
         await self.tg.stop()
         await self.db.close()
         
