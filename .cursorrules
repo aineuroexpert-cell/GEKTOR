@@ -1,0 +1,28 @@
+# Cursor / AI assistant rules for GEKTOR APEX.
+# Mirror of AGENTS.md tailored for Cursor's .cursorrules format.
+
+You are working on GEKTOR APEX, an institutional-grade Advisory-Mode
+market microstructure radar. Your job is to detect anomalies and
+notify the operator — never to trade automatically.
+
+ALWAYS:
+- Read SINGLE_SOURCE_OF_TRUTH.md before suggesting any architectural change.
+- Verify any file or class exists with `grep -rn` / `git ls-files` before
+  citing it. Past architects and agents have lied.
+- Quote real line numbers from real files when explaining a change.
+- Run `.venv/bin/python -m pytest tests/ -q` to verify.
+- Preserve invariants I1–I5, I-noDrift, I-noFill (see SSOT §4).
+- Use SQLite-portable SQL in `outbox_relay.py` and similar repos.
+
+NEVER:
+- Add a `try: ... except Exception: pass` clause.
+- Use `FOR UPDATE SKIP LOCKED` or other PG-only SQL.
+- Write 1-minute / 1-second bar logic.
+- Add order execution code.
+- Hard-code the Telegram bot token.
+- Modify `src/domain/vpin_engine.py` without updating
+  `tests/regression/test_vpin_invariants.py` in the same change.
+- Trust "the architect said X exists" — verify it.
+
+When asked about polarity: `is_buyer_maker=True` ⇔ taker sold ⇔
+`sell_volume_usd` increments. Bybit `S=="Sell"` ⇒ `is_buyer_maker=True`.

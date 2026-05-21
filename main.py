@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from src.application.outbox_alert_sink import OutboxAlertSink
 from src.application.radar_pipeline import RadarPipeline
+from src.application.watchdog import PartialBlindnessWatchdog
 from src.infrastructure.bybit import BybitRestClient
 from src.infrastructure.bybit_ws_ingestion import BybitWSIngestion
 from src.infrastructure.config import settings
@@ -66,6 +67,30 @@ class GektorRadarCore:
         )
         self._ws_tasks: list[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
+
+        async def _watchdog_sink(kind: str, metrics: dict) -> None:
+            """Bridge watchdog events to the operator via the existing Outbox."""
+            try:
+                from datetime import datetime, timezone as _tz
+                payload_text = (
+                    "⚠️ <b>[GEKTOR APEX] PARTIAL BLINDNESS</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 Событие: <code>{kind}</code>\n"
+                    f"💡 Символов: {metrics.get('symbols_tracked', 0)}\n"
+                    f"📦 ticks={metrics.get('tick_count', 0)} bars={metrics.get('bar_count', 0)}\n"
+                    f"⏰ {datetime.now(_tz.utc).strftime('%H:%M:%S')} UTC\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━"
+                )
+                await self.tg.notify_manual(payload_text, alert_type=kind)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"[WATCHDOG] alert dispatch failed: {exc}")
+
+        self.watchdog = PartialBlindnessWatchdog(
+            pipeline=self.radar,
+            alert_sink=_watchdog_sink,
+            silence_threshold_sec=float(os.getenv("WATCHDOG_SILENCE_SEC", "60")),
+            poll_interval_sec=float(os.getenv("WATCHDOG_POLL_SEC", "10")),
+        )
 
     async def _alert_engine(self) -> None:
         """
@@ -148,7 +173,8 @@ class GektorRadarCore:
         # Запуск подсистем конкурентно
         await asyncio.gather(
             self._alert_engine(),
-            self._radar_engine()
+            self._radar_engine(),
+            self.watchdog.run(self._shutdown_event),
         )
 
     async def shutdown(self, sig: signal.Signals) -> None:
