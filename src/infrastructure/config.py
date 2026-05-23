@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     VPIN_THRESHOLD: float = alpha.VPIN_EXHAUSTION_THRESHOLD
     WARMUP_VOLUME: float = 5_000_000.0
 
+    # [GEKTOR v3.0.0] Advisory Radar — Dollar Bar threshold
+    DOLLAR_THRESHOLD_BASE: float = Field(
+        default=1_000_000.0,
+        alias="dollar_threshold_base",
+        description="Dollar volume threshold per bar (USD). Lower = more bars/alerts."
+    )
+
     # [GEKTOR v5.22] Adaptive Volume Clocks
     VOLUME_BUCKETS: dict[str, float] = alpha.VOLUME_CLOCKS if alpha.VOLUME_CLOCKS else {"DEFAULT": 1_000_000.0}
 
@@ -81,6 +88,20 @@ class Settings(BaseSettings):
             token = self.TG_BOT_TOKEN.strip()
             if not re.match(r"^\d+:[A-Za-z0-9_-]{35,45}$", token):
                 raise ValueError("Invalid Telegram Bot Token signature format.")
+
+        # [GEKTOR v3.0.0] Bybit API Key/Secret regex validation
+        if self.BYBIT_API_KEY:
+            key = self.BYBIT_API_KEY.strip()
+            if not re.match(r"^[A-Za-z0-9]{18,24}$", key):
+                raise ValueError(
+                    f"Invalid Bybit API Key format (expected 18-24 alphanumeric chars, got {len(key)})."
+                )
+        if self.BYBIT_API_SECRET:
+            secret = self.BYBIT_API_SECRET.strip()
+            if not re.match(r"^[A-Za-z0-9]{36,50}$", secret):
+                raise ValueError(
+                    f"Invalid Bybit API Secret format (expected 36-50 alphanumeric chars, got {len(secret)})."
+                )
 
         return self
 

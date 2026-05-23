@@ -59,8 +59,10 @@ jobs:
           # (test_ingestor uses a mocked WS, no real API calls).
           BOT_TOKEN: "0:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
           CHAT_ID: "0"
-          BYBIT_API_KEY: "ci_dummy_key"
-          BYBIT_API_SECRET: "ci_dummy_secret"
+          # Must satisfy regex /^[A-Za-z0-9]{18,24}$/ (key) and /^[A-Za-z0-9]{36,50}$/ (secret)
+          # introduced in main by [GEKTOR APEX] config validator (commit 365b9a2).
+          BYBIT_API_KEY: "CIdummy0123456789ABCD"
+          BYBIT_API_SECRET: "CIdummy0123456789ABCDEFGHIJKLMNOPQRST"
           ASYNC_DATABASE_URL: "sqlite+aiosqlite:///:memory:"
         run: |
           python -m pytest tests/ -q --tb=short

@@ -110,6 +110,7 @@ WATCHDOG_POLL_SEC=10
 | `tests/regression/test_outbox_sqlite.py` | Outbox SQL portable claim pattern (SQLite + PostgreSQL) |
 | `tests/regression/test_ingestor_integration.py` | End-to-end синтетический Bybit-тейп → алерт |
 | `tests/regression/test_watchdog.py` | PARTIAL BLINDNESS state machine |
+| `tests/test_vpin_engine.py` | User-authored sanity tests (4) — absorption baseline, z_history independence, no inline import, finite z_score after warmup |
 
 Запуск:
 

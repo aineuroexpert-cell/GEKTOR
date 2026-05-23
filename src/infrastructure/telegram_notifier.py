@@ -49,16 +49,19 @@ class TelegramRadarNotifier:
         self.chat_id = chat_id
         self.proxy_url = proxy_url or settings.TELEGRAM_PROXY or settings.TG_PROXY_URL or settings.PROXY_URL
         self.bus = event_bus
-        self.api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        api_url_str = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         
         logger.info(f"🔑 [Telegram] Token loaded: {bool(self.bot_token)}, Chat ID: {bool(self.chat_id)}, Proxy: {self.proxy_url or 'NONE'}")
 
-        if not self.api_url.startswith("https://"):
+        if not api_url_str.startswith("https://"):
             raise ValueError("Insecure protocol: Telegram API must run over HTTPS.")
 
-        # Zero out sensitive token from memory immediately after initialization
+        # [GEKTOR v3.0.0] Store api_url in ctypes buffer for secure erasure on shutdown
         import ctypes
-        def zero_string(s: str) -> None:
+        self._api_url_buf = ctypes.create_string_buffer(api_url_str.encode('utf-8'))
+        self.api_url = api_url_str  # Live reference for aiohttp; will be zeroed on stop()
+
+        def _zero_string(s: str) -> None:
             if not isinstance(s, str) or not s:
                 return
             try:
@@ -74,8 +77,9 @@ class TelegramRadarNotifier:
                         ctypes.c_ubyte.from_address(id(s) + offset + i).value = 0
             except Exception:
                 pass
+        self._zero_string = _zero_string
 
-        zero_string(bot_token)
+        _zero_string(bot_token)
         self.bot_token = ""
         
         # [PSR 4.0] TRANSACTIONAL OUTBOX (Persistence > Speed)
@@ -480,4 +484,19 @@ class TelegramRadarNotifier:
     async def stop(self):
         self._running = False
         if self._worker_task: self._worker_task.cancel()
-        logger.info("🔌 [Telegram] Offline.")
+        
+        # [GEKTOR v3.0.0] Zero-out sensitive data from memory on shutdown
+        import ctypes
+        try:
+            if hasattr(self, '_api_url_buf') and self._api_url_buf:
+                ctypes.memset(ctypes.addressof(self._api_url_buf), 0, len(self._api_url_buf))
+            if hasattr(self, 'api_url') and self.api_url:
+                self._zero_string(self.api_url)
+                self.api_url = ""
+            if hasattr(self, 'proxy_url') and self.proxy_url:
+                self._zero_string(self.proxy_url)
+                self.proxy_url = ""
+        except Exception as e:
+            logger.debug(f"[Telegram] Memory wipe partial: {e}")
+        
+        logger.info("🔌 [Telegram] Offline. Sensitive data zeroed.")
