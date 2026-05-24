@@ -1,7 +1,7 @@
 # Taiwan proxy configured (socks5://)
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.shared.alpha_config import alpha
@@ -9,8 +9,27 @@ from src.shared.alpha_config import alpha
 
 class Settings(BaseSettings):
     # Telegram
-    TG_BOT_TOKEN: str = Field(default="", alias="gerald_bot_token")
-    TG_CHAT_ID: str = Field(default="", alias="telegram_chat_id")
+    # v3.6.1 deploy fix: accept several common env var names so operators
+    # don't have to remember the internal alias. All of these resolve to
+    # the same field: BOT_TOKEN, TELEGRAM_BOT_TOKEN, TG_BOT_TOKEN,
+    # GERALD_BOT_TOKEN (legacy).
+    TG_BOT_TOKEN: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "bot_token",
+            "telegram_bot_token",
+            "tg_bot_token",
+            "gerald_bot_token",
+        ),
+    )
+    TG_CHAT_ID: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "chat_id",
+            "telegram_chat_id",
+            "tg_chat_id",
+        ),
+    )
 
     # Infrastructure
     REDIS_HOST: str = Field(default="localhost", alias="redis_host")
@@ -26,9 +45,14 @@ class Settings(BaseSettings):
     TELEGRAM_PROXY: str | None = Field(default=None, alias="telegram_proxy")
     USE_PROXY_FOR_BYBIT: bool = Field(default=False, alias="use_proxy_for_bybit")
 
-    # Bybit credentials (critical, fail-fast)
-    BYBIT_API_KEY: str = Field(..., alias="bybit_api_key")
-    BYBIT_API_SECRET: str = Field(..., alias="bybit_api_secret")
+    # Bybit credentials.
+    # v3.6.1 deploy fix: optional by default — the Advisory radar uses
+    # ONLY the public publicTrade WS endpoint, which does not require
+    # authentication. If the operator sets these (e.g. for a future REST
+    # client used for symbol discovery), they MUST satisfy the regex
+    # validators below. Empty values are accepted and skip validation.
+    BYBIT_API_KEY: str = Field(default="", alias="bybit_api_key")
+    BYBIT_API_SECRET: str = Field(default="", alias="bybit_api_secret")
     BYBIT_ACCOUNT_TYPE: str = "UNIFIED"
 
     # [GEKTOR v5.22] Math calibration via AlphaConfig
@@ -67,19 +91,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_critical_runtime_vars(self) -> "Settings":
-        missing: list[str] = []
-
+        # v3.6.1: only the DB URL is strictly required. Bybit keys are
+        # optional (Advisory radar uses public WS), but if provided they
+        # must satisfy the format regex.
         if not self.ASYNC_DATABASE_URL.strip():
-            missing.append("async_database_url")
-        if not self.BYBIT_API_KEY.strip():
-            missing.append("bybit_api_key")
-        if not self.BYBIT_API_SECRET.strip():
-            missing.append("bybit_api_secret")
-
-        if missing:
-            required = ", ".join(missing)
             raise ValueError(
-                f"Critical runtime configuration is missing or empty: {required}. "
+                "Critical runtime configuration is missing or empty: async_database_url. "
                 "Set required variables in environment or .env before startup."
             )
 
@@ -89,14 +106,14 @@ class Settings(BaseSettings):
             if not re.match(r"^\d+:[A-Za-z0-9_-]{35,45}$", token):
                 raise ValueError("Invalid Telegram Bot Token signature format.")
 
-        # [GEKTOR v3.0.0] Bybit API Key/Secret regex validation
-        if self.BYBIT_API_KEY:
+        # Bybit API Key/Secret regex validation (only if provided).
+        if self.BYBIT_API_KEY.strip():
             key = self.BYBIT_API_KEY.strip()
             if not re.match(r"^[A-Za-z0-9]{18,24}$", key):
                 raise ValueError(
                     f"Invalid Bybit API Key format (expected 18-24 alphanumeric chars, got {len(key)})."
                 )
-        if self.BYBIT_API_SECRET:
+        if self.BYBIT_API_SECRET.strip():
             secret = self.BYBIT_API_SECRET.strip()
             if not re.match(r"^[A-Za-z0-9]{36,50}$", secret):
                 raise ValueError(
@@ -136,8 +153,20 @@ class Settings(BaseSettings):
                 zero_string(val)
                 setattr(self, field, "")
 
-        # Purge environment variables
-        for env_var in ["BYBIT_API_KEY", "BYBIT_API_SECRET", "GERALD_BOT_TOKEN", "TELEGRAM_CHAT_ID"]:
+        # Purge environment variables. Cover every accepted alias for
+        # the Telegram token / chat id (v3.6.1 added BOT_TOKEN / TELEGRAM_*
+        # variants — wipe them all, not just the legacy names).
+        for env_var in (
+            "BYBIT_API_KEY",
+            "BYBIT_API_SECRET",
+            "BOT_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "TG_BOT_TOKEN",
+            "GERALD_BOT_TOKEN",
+            "CHAT_ID",
+            "TELEGRAM_CHAT_ID",
+            "TG_CHAT_ID",
+        ):
             val = os.environ.pop(env_var, None)
             if val:
                 zero_string(val)

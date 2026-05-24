@@ -54,15 +54,10 @@ jobs:
 
       - name: Run pytest (radar contour)
         env:
-          # Dummy values to satisfy pydantic-settings validators in modules
-          # that touch settings at import time. Never used by tests
-          # (test_ingestor uses a mocked WS, no real API calls).
-          BOT_TOKEN: "0:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-          CHAT_ID: "0"
-          # Must satisfy regex /^[A-Za-z0-9]{18,24}$/ (key) and /^[A-Za-z0-9]{36,50}$/ (secret)
-          # introduced in main by [GEKTOR APEX] config validator (commit 365b9a2).
-          BYBIT_API_KEY: "CIdummy0123456789ABCD"
-          BYBIT_API_SECRET: "CIdummy0123456789ABCDEFGHIJKLMNOPQRST"
+          # The only strictly required setting is ASYNC_DATABASE_URL. Bybit
+          # API keys are now optional (Advisory radar uses public WS only),
+          # and Telegram credentials are optional too. Tests use a mocked WS
+          # and in-memory SQLite — no real network calls.
           ASYNC_DATABASE_URL: "sqlite+aiosqlite:///:memory:"
         run: |
           python -m pytest tests/ -q --tb=short
