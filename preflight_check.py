@@ -77,7 +77,9 @@ key_files = [
     ("config.py", os.path.join(INF, "config.py")),
     ("math_core.py", os.path.join(DOM, "math_core.py")),
     ("dollar_bar.py", os.path.join(DOM, "dollar_bar.py")),
-    ("orchestrator.py", os.path.join(APP, "orchestrator.py")),
+    ("radar_pipeline.py", os.path.join(APP, "radar_pipeline.py")),
+    ("outbox_relay.py", os.path.join(APP, "outbox_relay.py")),
+    ("watchdog.py", os.path.join(APP, "watchdog.py")),
 ]
 for name, path in key_files:
     check(f"{name} существует", os.path.isfile(path))
