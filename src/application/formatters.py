@@ -11,7 +11,6 @@ SECURITY: Never trust raw payload strings. Always escape before embedding in HTM
 from __future__ import annotations
 
 import html
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -57,14 +56,15 @@ class TelegramMessageFormatter:
         event_type = str(payload.get("event_type", "")).upper()
 
         router: dict[str, Any] = {
-            "STARTUP":   self._fmt_startup,
-            "HEARTBEAT": self._fmt_heartbeat,
-            "APPROVED":  self._fmt_approved,
-            "REJECTED":  self._fmt_rejected,
-            "ERROR":     self._fmt_error,
-            "CRITICAL":  self._fmt_critical,
-            "ABORT":     self._fmt_abort,
-            "RAW_TEXT":  self._fmt_raw_text,
+            "STARTUP":      self._fmt_startup,
+            "HEARTBEAT":    self._fmt_heartbeat,
+            "APPROVED":     self._fmt_approved,
+            "REJECTED":     self._fmt_rejected,
+            "ERROR":        self._fmt_error,
+            "CRITICAL":     self._fmt_critical,
+            "ABORT":        self._fmt_abort,
+            "RAW_TEXT":     self._fmt_raw_text,
+            "RADAR_ALERT":  self._fmt_radar_alert,
         }
 
         handler = router.get(event_type)
@@ -218,3 +218,40 @@ class TelegramMessageFormatter:
         """Fallback for pre-formatted or plain-text payloads."""
         text = payload.get("text", payload.get("fact", ""))
         return self._esc(text)
+
+    def _fmt_radar_alert(self, payload: dict[str, Any]) -> str:
+        """Advisory-Mode RADAR_ALERT (v3.6.0 APEX-RADAR).
+
+        Canonical schema produced by src/application/outbox_alert_sink.py.
+        """
+        symbol = self._esc(payload.get("symbol", "UNKNOWN"))
+        direction_raw = str(payload.get("direction", "")).upper()
+        direction = "🟢 LONG (Покупка)" if direction_raw == "LONG" else (
+            "🔴 SHORT (Продажа)" if direction_raw == "SHORT" else "⚪ NEUTRAL"
+        )
+        vpin = self._safe_float(payload.get("vpin"))
+        z = self._safe_float(payload.get("z_score"))
+        absorption = bool(payload.get("absorption", False))
+        bar_close = self._safe_float(payload.get("bar_close"))
+        bar_open = self._safe_float(payload.get("bar_open"))
+        ts = self._ts_utc(payload)
+
+        absorption_line = (
+            "🧊 <b>Iceberg detected</b> (скрытая ликвидность поглощает поток)"
+            if absorption
+            else "⚡ Чистый импульс (без поглощения)"
+        )
+
+        return (
+            "🚨 <b>[GEKTOR APEX] RADAR ALERT</b> 🚨\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Инструмент: <code>{symbol}</code>\n"
+            f"🧭 Направление: {direction}\n"
+            f"🌀 VPIN: <code>{vpin:.4f}</code>\n"
+            f"📈 Z-Score: <code>{z:.2f}</code>\n"
+            f"💵 Bar: <code>{bar_open:.4f}</code> → <code>{bar_close:.4f}</code>\n"
+            f"{absorption_line}\n"
+            f"⏰ <code>{ts} UTC</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🧠 <b>СТАТУС: Среднесрочная аномалия, ручная верификация</b>"
+        )

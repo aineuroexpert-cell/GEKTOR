@@ -31,6 +31,8 @@ pytest = "7.4.3"
 pytest-asyncio = "0.23.2"
 testcontainers = { version = "3.7.1", extras = ["postgres"] }
 freezegun = "1.2.2"
+hypothesis = "^6.100"
+aiosqlite = "^0.19"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
@@ -62,9 +64,20 @@ select = [
     "PL",  # Pylint
     "ASYNC" # flake8-async
 ]
-ignore = ["PLR0913"] # Allow more than 5 arguments in functions
+ignore = [
+    "PLR0913",  # Allow more than 5 arguments in functions
+    "PLR2004",  # Magic value comparisons are fine in tests and math hot paths
+    "PLR0912",  # Branch count: VPIN engine hot path is deliberately monolithic
+    "PLR0915",  # Statement count: ditto
+    "PLC0415",  # Inline imports in __main__ blocks are explicit and intentional
+    "W291",     # Trailing whitespace — handled by black, not by ruff in this repo
+]
 
-[tool.ruff.lint.mccabe]
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004"]
+"src/domain/vpin_engine.py" = ["PLR0912", "PLR0915"]
+
+[tool.ruff.mccabe]
 max-complexity = 15
 
 [tool.pytest.ini_options]

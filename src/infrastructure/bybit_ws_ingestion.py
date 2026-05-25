@@ -71,22 +71,34 @@ class BybitWSIngestion:
             logger.error(f"[INGESTION] Отсутствует ключ в payload: {e}")
 
     async def run(self, symbols: list[str], shutdown_event: asyncio.Event) -> None:
-        """Жизненный цикл подключения с авто-реконнектом (Exponential Backoff)."""
+        """WS lifecycle with exponential backoff.
+
+        v3.6.0 hardening:
+          * Backoff resets only after the FIRST in-band trade tick lands —
+            short-lived "successful" handshakes followed by an immediate
+            close (auth/subscribe failure) no longer reset the backoff
+            and cause a tight reconnect loop.
+          * Ping task is cancelled AND awaited on each disconnect to
+            avoid leaking pending coroutines (sources of "Task was
+            destroyed but it is pending" warnings).
+          * Backoff is capped at 60s and increases by 1.7x not 2x so we
+            don't go from 30s to 60s in a single step.
+        """
         backoff = 1.0
         self.session = aiohttp.ClientSession()
-        
+
         try:
             while not shutdown_event.is_set():
                 logger.info(f"[INGESTION] Подключение к {self.ws_url}...")
+                ping_task: asyncio.Task | None = None
+                first_tick_seen = False
                 try:
                     async with self.session.ws_connect(self.ws_url, heartbeat=None) as ws:
                         logger.info("[INGESTION] Установлено WS соединение. Триггер RESYNC.")
-                        
+
                         # [STRESS-TEST ЗАЩИТА] Немедленно сбрасываем отравленный стейт
                         await self.aggregator.handle_resync()
-                        
-                        backoff = 1.0 # Reset backoff
-                        
+
                         # Подписка
                         args = [f"publicTrade.{sym}" for sym in symbols]
                         sub_req = orjson.dumps({"op": "subscribe", "args": args})
@@ -103,15 +115,25 @@ class BybitWSIngestion:
                                 # Bybit шлет текст, но aiohttp может выдать bytes
                                 raw_bytes = msg.data if isinstance(msg.data, bytes) else msg.data.encode('utf-8')
                                 await self._process_message(raw_bytes)
+                                if not first_tick_seen:
+                                    first_tick_seen = True
+                                    backoff = 1.0
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
 
-                        ping_task.cancel()
-                        
                 except Exception as e:
                     logger.warning(f"[INGESTION] Разрыв сокета: {e}. Реконнект через {backoff}s...")
+                finally:
+                    if ping_task is not None:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+                if not shutdown_event.is_set():
                     await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 30.0)
+                    backoff = min(backoff * 1.7, 60.0)
         finally:
             await self.session.close()
             logger.info("[INGESTION] Сетевой мост разрушен.")

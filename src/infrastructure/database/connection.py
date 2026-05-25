@@ -340,15 +340,30 @@ class DatabaseManager:
 
     def __init__(self):
         import sys
-        if sys.platform == "win32":
-            # For Windows staging, use local SQLite to avoid needing Postgres
+
+        # v3.6.1 deploy fix: dispatch by URL scheme, not by host OS. The
+        # asyncpg-specific kwargs (pool_size, max_overflow, command_timeout)
+        # cause `TypeError: Invalid argument(s) ... sent to create_engine`
+        # when the URL points at SQLite/aiosqlite (which uses NullPool and
+        # does not accept those args). Previously Linux hosts on SQLite
+        # would crash at startup.
+        url = (
+            "sqlite+aiosqlite:///gektor.db"
+            if sys.platform == "win32"
+            else settings.ASYNC_DATABASE_URL
+        )
+
+        if url.startswith("sqlite"):
+            # NullPool is used automatically for sqlite+aiosqlite; do NOT
+            # pass pool_size/max_overflow/pool_recycle/command_timeout.
             self.engine = create_async_engine(
-                "sqlite+aiosqlite:///gektor.db",
+                url,
                 pool_pre_ping=True,
             )
         else:
+            # PostgreSQL via asyncpg.
             self.engine = create_async_engine(
-                settings.ASYNC_DATABASE_URL,
+                url,
                 pool_size=50,
                 max_overflow=20,
                 pool_recycle=300,

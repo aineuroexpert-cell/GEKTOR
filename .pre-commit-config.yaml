@@ -1,0 +1,40 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(legacy/|docs/.*\.md$)
+      - id: end-of-file-fixer
+        exclude: ^(legacy/|docs/.*\.md$)
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: check-toml
+
+  - repo: local
+    hooks:
+      - id: no-telegram-token
+        name: Block accidental commits of Telegram bot token
+        entry: bash -c 'if git diff --cached | grep -qE "BOT_TOKEN=[0-9]+:[A-Za-z0-9_-]{35,}"; then echo "REJECTED: BOT_TOKEN literal detected in diff. Move it to .env.production on the VPS."; exit 1; fi'
+        language: system
+        pass_filenames: false
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.7
+    hooks:
+      - id: ruff
+        # Enforce lint only on the radar contour. Legacy modules are
+        # tracked separately via the lint-radar-contour CI job.
+        files: ^(src/domain/(vpin_engine|conflation)\.py|src/application/(radar_pipeline|watchdog|outbox_alert_sink|outbox_relay|formatters)\.py|tests/regression/.*\.py)$
+        args: ["--fix"]
+
+  - repo: local
+    hooks:
+      - id: pytest-radar-fast
+        name: Run radar regression tests (fast)
+        entry: .venv/bin/python -m pytest tests/regression/ -q --tb=short
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

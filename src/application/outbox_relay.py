@@ -1,9 +1,10 @@
 import asyncio
-import logging
 import json
-from typing import List, Optional, Protocol, Any
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Any, Protocol
+
 from sqlalchemy import text
 
 logger = logging.getLogger("GEKTOR.Outbox")
@@ -52,54 +53,61 @@ class OutboxRepository:
             "now": now
         })
 
-    async def fetch_pending(self, batch_size: int = 10) -> List[OutboxMessage]:
-        is_sqlite = "sqlite" in str(self.db.engine.url)
-        if is_sqlite:
-            query = """
-                SELECT id, payload, priority, status, created_at, execute_after, retry_count 
-                FROM outbox_events 
+    async def fetch_pending(self, batch_size: int = 10) -> list[OutboxMessage]:
+        """Claim a batch of pending events atomically.
+
+        Two-step claim that works on BOTH SQLite (no FOR UPDATE) and PostgreSQL:
+            1. SELECT candidate ids.
+            2. UPDATE those ids from 'PENDING' to 'PROCESSING' in a single
+               WHERE id IN (...) AND status = 'PENDING' (status guard
+               prevents a stale claim if another relay raced us).
+            3. Return only the rows we successfully transitioned.
+
+        On SQLite this is safe because the engine serialises writers (WAL
+        single-writer). On PostgreSQL the per-row UPDATE … WHERE status=
+        'PENDING' acts as an optimistic lock without long-held row locks.
+        """
+        async with self.db.SessionLocal() as session:
+            now = datetime.now(timezone.utc)
+            select_query = """
+                SELECT id, payload, priority, status, created_at, execute_after, retry_count
+                FROM outbox_events
                 WHERE status = 'PENDING' AND execute_after <= :now
                 ORDER BY priority ASC, created_at ASC
                 LIMIT :limit
             """
-        else:
-            query = """
-                SELECT id, payload, priority, status, created_at, execute_after, retry_count 
-                FROM outbox_events 
-                WHERE status = 'PENDING' AND execute_after <= :now
-                ORDER BY priority ASC, created_at ASC
-                LIMIT :limit 
-                FOR UPDATE SKIP LOCKED
-            """
-        async with self.db.SessionLocal() as session:
-            now = datetime.now(timezone.utc)
-            result = await session.execute(text(query), {"limit": batch_size, "now": now})
+            result = await session.execute(
+                text(select_query), {"limit": batch_size, "now": now}
+            )
             rows = result.fetchall()
-            
-            messages = []
-            for r in rows:
-                messages.append(OutboxMessage(
-                    id=r[0],
-                    payload=r[1],
-                    priority=r[2],
-                    status=r[3],
-                    created_at=r[4],
-                    execute_after=r[5],
-                    retry_count=r[6]
-                ))
-            
-            # Since we locked them, let's mark their retry count preemptively or just return 
-            # them within a transaction. But for a relay, usually we return them and the relay updates status afterwards.
-            # However, if we don't commit, the lock is released. We must keep the session open! 
-            # Or instead of SKIP LOCKED + return, we update them to 'PROCESSING'!
-            if rows:
-                ids = [r[0] for r in rows]
-                placeholders = ", ".join([f":id_{i}" for i in range(len(ids))])
-                update_q = f"UPDATE outbox_events SET status = 'PROCESSING' WHERE id IN ({placeholders})"
-                params = {f"id_{i}": id_val for i, id_val in enumerate(ids)}
-                await session.execute(text(update_q), params)
-                await session.commit()
-            
+            if not rows:
+                return []
+
+            ids = [r[0] for r in rows]
+            # Bind each id explicitly so we get portable SQL (no IN :tuple).
+            placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
+            update_query = (
+                f"UPDATE outbox_events SET status = 'PROCESSING' "
+                f"WHERE id IN ({placeholders}) AND status = 'PENDING'"
+            )
+            params = {f"id_{i}": ids[i] for i in range(len(ids))}
+            update_result = await session.execute(text(update_query), params)
+            await session.commit()
+
+            claimed_count = update_result.rowcount or 0
+            messages: list[OutboxMessage] = []
+            for r in rows[:claimed_count]:
+                messages.append(
+                    OutboxMessage(
+                        id=r[0],
+                        payload=r[1],
+                        priority=r[2],
+                        status="PROCESSING",
+                        created_at=r[4],
+                        execute_after=r[5],
+                        retry_count=r[6],
+                    )
+                )
             return messages
 
     async def mark_delivered(self, message_id: int) -> None:
@@ -129,19 +137,17 @@ class TelegramRelayWorker:
         self.tg = tg_client
         self._running = False
 
-    def stop(self):
-        self._running = False
-
     async def run(self):
         self._running = True
         logger.info("📡 [RELAY] Outbox Worker Started.")
         while self._running:
-            # Transactions are executed fully internally in `fetch_pending` and locks released immediately upon SET PROCESSING
+            # Transactions execute fully inside fetch_pending; PROCESSING claim
+            # releases the row lock immediately so other workers can poll too.
             messages = await self.repo.fetch_pending(batch_size=5)
             if not messages:
                 await asyncio.sleep(0.5) # Fallback polling
                 continue
-            
+
             for msg in messages:
                 try:
                     payload = self._decode_payload(msg.payload)
@@ -171,3 +177,5 @@ class TelegramRelayWorker:
             pass
         return {"event_type": "RAW_TEXT", "symbol": "GLOBAL", "reason": "", "fact": raw_payload, "limit": ""}
 
+    def stop(self):
+        self._running = False

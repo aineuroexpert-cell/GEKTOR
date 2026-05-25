@@ -1,297 +1,335 @@
-# src/application/radar_pipeline.py
 """
-[GEKTOR APEX v3.0.0] Radar Pipeline — Advisory Mode Engine.
+[GEKTOR APEX v3.6.0 "APEX-RADAR"] RadarPipeline — Advisory Mode core.
 
-The brain of the Predator Radar. Orchestrates the full data flow:
+Wires the Quantitative Core (DollarBarEngine + O1VPINEngine) to the
+Presentation layer (Outbox -> Telegram). Per-symbol state is created lazily
+on the first tick.
 
-  Bybit Public WS (ALL linear futures)
-    → Trade Tape Ingestion (orjson zero-copy)
-    → Dollar Bar Aggregation (per-symbol, Decimal-based)
-    → O(1) VPIN Engine (per-symbol, numpy ring buffer)
-    → Anomaly Detection (Z-Score threshold + Iceberg Verification)
-    → Telegram Alert Dispatch (debounced, HTML-formatted)
+Data flow:
+    BybitWSIngestion._process_message
+        -> RadarPipeline.on_trade(symbol, side, price, size, ts)
+            -> DollarBarEngine.process_tick(...)
+                # bar closes when threshold reached
+                -> _on_bar_closed(bar)
+                    -> O1VPINEngine.process_bar(bar)
+                        # signal emitted when warmup done
+                        -> _dispatch_alert(symbol, bar, signal)
 
-Architecture:
-  - Single asyncio Task per concern (no blocking, no threading).
-  - Symbol discovery via Bybit REST API (auto-refresh every 6 hours).
-  - Per-symbol state isolation: each symbol gets its own DollarBarEngine + VPIN.
-  - Alert debouncing: max 1 alert per symbol per 5 minutes.
-  - No execution logic. Read-only market data. Advisory Only.
+THIS IS THE CANONICAL PIPELINE. It replaces the previous TODO-stub
+`_radar_engine` in main.py.
 
-Philosophy:
-  "The goal is not to trade — it's to detect the moment
-   when informed participants reveal their hand."
+Polarity contract (invariant I5 of vpin_engine.py):
+    BybitWSIngestion sets is_buyer_maker = (trade["S"] == "Sell").
+    RadarPipeline forwards is_buyer_maker unchanged to DollarBarEngine.
+    DollarBarEngine (conflation.py:96-101) then increments sell_volume_usd
+    when is_buyer_maker=True. Do not invert.
 """
 from __future__ import annotations
 
 import asyncio
 import time
-from decimal import Decimal
-from typing import Dict, Optional, Any
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from decimal import Decimal
 
 from loguru import logger
 
 from src.domain.conflation import DollarBar, DollarBarEngine
+from src.domain.liquidity_detectors import (
+    LiquidityAlert,
+    LiquidityDetectorBank,
+)
 from src.domain.vpin_engine import O1VPINEngine, VPINSignal
-from src.infrastructure.bybit import BybitRestClient
-from src.infrastructure.config import settings
-from src.shared.alpha_config import alpha
 
 
-# ═══════════════════════════════════════════════════════════════════
-# VALUE OBJECTS
-# ═══════════════════════════════════════════════════════════════════
-
-@dataclass(slots=True, frozen=True)
-class AnomalyAlert:
-    """Immutable alert payload for Telegram dispatch."""
+@dataclass(slots=True)
+class RadarAlert:
     symbol: str
+    timestamp: float
+    bar_open: float
+    bar_close: float
     vpin: float
     z_score: float
+    direction: str  # "long" | "short"
     absorption: bool
-    bar_close_price: float
-    bar_volume_usd: float
-    detected_at: float  # monotonic timestamp
 
 
-# ═══════════════════════════════════════════════════════════════════
-# ALERT DEBOUNCER
-# ═══════════════════════════════════════════════════════════════════
+# Type for the side-effect callback that ships an alert to the outbox /
+# notifier. Kept simple so it can be a closure over a Telegram client.
+AlertSink = Callable[[RadarAlert], Awaitable[None]]
+LiquidityAlertSink = Callable[[LiquidityAlert], Awaitable[None]]
+ThresholdProvider = Callable[[str], Decimal]
 
-class AlertDebouncer:
+
+class _SymbolPerSymbolRateLimiter:
+    """Suppresses duplicate alerts for the same symbol fired within `cooldown` seconds.
+
+    The pipeline can otherwise emit a flurry of alerts on a sustained
+    imbalance (Z-Score stays above threshold for many bars). One alert per
+    symbol per `cooldown_sec` is enough for a manual operator.
     """
-    Per-symbol cooldown to prevent alert spam.
-    Only 1 alert per symbol per `cooldown_sec` seconds.
-    """
-    __slots__ = ('_last_alert', '_cooldown')
 
-    def __init__(self, cooldown_sec: float = 300.0):
-        self._last_alert: Dict[str, float] = {}
-        self._cooldown = cooldown_sec
+    __slots__ = ("_cooldown_sec", "_last_alert")
 
-    def allow(self, symbol: str, now: float) -> bool:
-        last = self._last_alert.get(symbol, 0.0)
-        if now - last >= self._cooldown:
-            self._last_alert[symbol] = now
-            return True
-        return False
+    def __init__(self, cooldown_sec: float) -> None:
+        self._cooldown_sec = cooldown_sec
+        self._last_alert: dict[str, float] = {}
 
-    def remaining_sec(self, symbol: str, now: float) -> float:
-        last = self._last_alert.get(symbol, 0.0)
-        return max(0.0, self._cooldown - (now - last))
+    def allow(self, symbol: str, now: float | None = None) -> bool:
+        if now is None:
+            now = time.monotonic()
+        last = self._last_alert.get(symbol)
+        if last is not None and (now - last) < self._cooldown_sec:
+            return False
+        self._last_alert[symbol] = now
+        return True
 
-
-# ═══════════════════════════════════════════════════════════════════
-# CORE PIPELINE
-# ═══════════════════════════════════════════════════════════════════
 
 class RadarPipeline:
-    """
-    [GEKTOR v3.0.0] The Predator Radar Core.
+    """Advisory-mode market microstructure radar.
 
-    Responsibilities:
-      1. Discover ALL USDT-linear futures on Bybit (auto-refresh).
-      2. Subscribe to publicTrade streams for each symbol.
-      3. Aggregate raw ticks into Dollar Bars (per-symbol, $1M default threshold).
-      4. Feed closed bars into O(1) VPIN Engine.
-      5. On anomaly detection → format and dispatch Telegram alert.
-
-    NOT responsible for: execution, position management, order routing.
+    Manages per-symbol DollarBar + VPIN engines and forwards anomaly signals
+    to the alert sink. **Does not perform any I/O of its own** — pure
+    application-layer orchestration.
     """
 
     def __init__(
         self,
-        tg_notify_callback,
-        db_push_callback=None,
-        dollar_threshold_usd: float = 1_000_000.0,
-        vpin_window: int = 50,
-        vpin_z_threshold: float = 2.5,
-        alert_cooldown_sec: float = 300.0,
-    ):
-        self._tg_notify = tg_notify_callback
-        self._db_push = db_push_callback
+        threshold_usd: Decimal,
+        alert_sink: AlertSink,
+        window_size: int = 50,
+        z_threshold: float = 2.5,
+        z_history_size: int = 500,
+        per_symbol_cooldown_sec: float = 300.0,
+        threshold_provider: ThresholdProvider | None = None,
+        liquidity_detectors: LiquidityDetectorBank | None = None,
+        liquidity_alert_sink: LiquidityAlertSink | None = None,
+    ) -> None:
+        self.threshold_usd = threshold_usd
+        self._alert_sink = alert_sink
+        self._window_size = window_size
+        self._z_threshold = z_threshold
+        self._z_history_size = z_history_size
+        self._threshold_provider = threshold_provider
 
-        # Configuration
-        self._dollar_threshold = Decimal(str(dollar_threshold_usd))
-        self._vpin_window = vpin_window
-        self._vpin_z_threshold = vpin_z_threshold
+        # Shared DollarBarEngine — its internal `_current_bars` dict already
+        # partitions by symbol, so a single instance handles the whole universe.
+        # v3.6.2: per-symbol adaptive threshold provider can override the base.
+        self._bar_engine: DollarBarEngine = DollarBarEngine(
+            threshold_usd=threshold_usd,
+            threshold_provider=threshold_provider,
+        )
+        self._bar_engine.set_callback(self._on_bar_closed)
 
-        # Per-symbol engines (created lazily on first trade)
-        self._bar_engines: Dict[str, DollarBarEngine] = {}
-        self._vpin_engines: Dict[str, O1VPINEngine] = {}
+        # One VPIN engine per symbol. Created lazily.
+        self._vpin_engines: dict[str, O1VPINEngine] = {}
 
-        # Alert debouncing
-        self._debouncer = AlertDebouncer(cooldown_sec=alert_cooldown_sec)
+        # Per-symbol rate limiter to keep Telegram traffic civilised.
+        self._rate_limiter = _SymbolPerSymbolRateLimiter(per_symbol_cooldown_sec)
 
-        # Metrics
-        self._total_ticks: int = 0
-        self._total_bars: int = 0
-        self._total_anomalies: int = 0
-        self._symbols_active: int = 0
-        self._start_time: float = 0.0
+        # v3.6.2: optional instant-fire liquidity detectors (no warmup).
+        self._liquidity_detectors = liquidity_detectors
+        self._liquidity_alert_sink = liquidity_alert_sink or self._default_liquidity_sink(alert_sink)
 
-    # ──────────────────────────────────────────────
-    # PUBLIC API
-    # ──────────────────────────────────────────────
+        # Lightweight metrics (read by /health endpoint and tests).
+        self._tick_count: int = 0
+        self._bar_count: int = 0
+        self._signal_count: int = 0
+        self._alert_count: int = 0
+        self._liquidity_alert_count: int = 0
+        self._last_tick_ts: float | None = None
 
-    async def on_trade(self, symbol: str, trade: dict) -> None:
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def on_trade(
+        self,
+        symbol: str,
+        side: str,
+        price: Decimal,
+        size: Decimal,
+        exchange_ts: float,
+    ) -> None:
+        """Ingest a single trade tick from the WS feed.
+
+        `side` is the AGGRESSOR side as reported by Bybit ("Buy" or "Sell").
+        We map it to is_buyer_maker: when the aggressor is a seller, the
+        maker (resting order) was a buyer.
         """
-        Hot path entry point. Called by BybitIngestor for every trade tick.
+        is_buyer_maker = side == "Sell"  # invariant I5
+        await self.process_tick(
+            symbol=symbol,
+            price=price,
+            size=size,
+            is_buyer_maker=is_buyer_maker,
+            exchange_ts=exchange_ts,
+        )
 
-        Args:
-            symbol: e.g. "BTCUSDT"
-            trade: {"price": float, "volume": float, "side": str, "ts": int}
+    async def process_tick(
+        self,
+        symbol: str,
+        price: Decimal,
+        size: Decimal,
+        is_buyer_maker: bool,
+        exchange_ts: float,
+    ) -> None:
+        """IBarAggregator protocol entry point used by BybitWSIngestion.
+
+        This is the canonical hot-path called by the ingestor. `on_trade`
+        is a convenience wrapper that accepts the raw Bybit `side` string.
         """
-        self._total_ticks += 1
+        self._tick_count += 1
+        self._last_tick_ts = exchange_ts
 
-        price = Decimal(str(trade["price"]))
-        size = Decimal(str(trade["volume"]))
-        side = trade.get("side", "Buy")
-        ts = trade.get("ts", time.time())
+        # v3.6.2: run instant-fire liquidity detectors BEFORE bar aggregation,
+        # so they can alert on raw ticks regardless of bar warmup state.
+        if self._liquidity_detectors is not None and self._liquidity_detectors.enabled:
+            liquidity_alerts = self._liquidity_detectors.process_tick(
+                symbol=symbol,
+                is_buyer_maker=is_buyer_maker,
+                price=float(price),
+                size=float(size),
+                ts=exchange_ts,
+            )
+            for alert in liquidity_alerts:
+                # Rate-limit liquidity alerts under the same per-symbol cooldown
+                # as VPIN alerts — prevents flooding when both fire on the same
+                # event. Use a derived key so Sweep and OFI Pulse don't shadow VPIN.
+                if not self._rate_limiter.allow(f"{alert.kind}:{alert.symbol}"):
+                    continue
+                await self._dispatch_liquidity_alert(alert)
 
-        # side — это сторона TAKER'а на Bybit Linear Futures publicTrade
-        # is_buyer_maker=True означает: taker продал, значит maker купил
-        is_buyer_maker = (side == "Sell")  # True when taker=Sell → maker=Buy
+        await self._bar_engine.process_tick(
+            symbol=symbol,
+            price=price,
+            size=size,
+            is_buyer_maker=is_buyer_maker,
+            exchange_ts=exchange_ts,
+        )
 
-        # Lazy initialization of per-symbol engines
-        if symbol not in self._bar_engines:
-            self._init_symbol(symbol)
+    async def handle_resync(self) -> None:
+        """Drop poisoned in-flight bars on WS reconnect.
 
-        bar_engine = self._bar_engines[symbol]
-        await bar_engine.process_tick(symbol, price, size, is_buyer_maker, float(ts))
+        VPIN ring buffers are deliberately NOT reset here. We trust the
+        statistics already accumulated; a single missing bar is preferable
+        to losing the warmup history.
+        """
+        await self._bar_engine.handle_resync()
 
-    async def get_stats(self) -> dict:
-        """Returns pipeline statistics for health monitoring."""
-        uptime = time.monotonic() - self._start_time if self._start_time else 0
+    def metrics(self) -> dict[str, float | int | None]:
         return {
-            "symbols_tracked": len(self._bar_engines),
-            "total_ticks": self._total_ticks,
-            "total_bars_closed": self._total_bars,
-            "total_anomalies": self._total_anomalies,
-            "uptime_hours": round(uptime / 3600, 2),
-            "ticks_per_sec": round(self._total_ticks / max(1, uptime), 1),
+            "tick_count": self._tick_count,
+            "bar_count": self._bar_count,
+            "signal_count": self._signal_count,
+            "alert_count": self._alert_count,
+            "liquidity_alert_count": self._liquidity_alert_count,
+            "last_tick_ts": self._last_tick_ts,
+            "symbols_tracked": len(self._vpin_engines),
         }
 
-    def start(self) -> None:
-        """Mark pipeline start time."""
-        self._start_time = time.monotonic()
-        logger.info(
-            f"🎯 [RADAR] Pipeline armed. "
-            f"Dollar threshold: ${self._dollar_threshold:,.0f} | "
-            f"VPIN window: {self._vpin_window} | "
-            f"Z-threshold: {self._vpin_z_threshold}"
-        )
+    # ------------------------------------------------------------------
+    # Internal: bar closure callback
+    # ------------------------------------------------------------------
 
-    # ──────────────────────────────────────────────
-    # PRIVATE: Per-Symbol Initialization
-    # ──────────────────────────────────────────────
-
-    def _init_symbol(self, symbol: str) -> None:
-        """Lazily create Dollar Bar + VPIN engines for a new symbol."""
-        bar_engine = DollarBarEngine(threshold_usd=self._dollar_threshold)
-        vpin_engine = O1VPINEngine(
-            window_size=self._vpin_window,
-            volume_threshold=float(self._dollar_threshold),
-            z_threshold=self._vpin_z_threshold,
-        )
-
-        # Wire callback: when bar closes → feed into VPIN
-        bar_engine.set_callback(self._make_bar_handler(symbol, vpin_engine))
-
-        self._bar_engines[symbol] = bar_engine
-        self._vpin_engines[symbol] = vpin_engine
-        self._symbols_active += 1
-
-        if self._symbols_active % 50 == 0:
-            logger.info(f"📡 [RADAR] Tracking {self._symbols_active} symbols now.")
-
-    def _make_bar_handler(self, symbol: str, vpin_engine: O1VPINEngine):
-        """Creates a closure that processes a closed Dollar Bar through VPIN."""
-
-        async def _on_bar_closed(bar: DollarBar) -> None:
-            self._total_bars += 1
-
-            # Feed into VPIN
-            signal: Optional[VPINSignal] = vpin_engine.process_bar(bar)
-
-            if signal is None:
-                return  # VPIN still warming up
-
-            if signal.is_anomaly:
-                self._total_anomalies += 1
-                now = time.monotonic()
-
-                if self._debouncer.allow(symbol, now):
-                    alert = AnomalyAlert(
-                        symbol=symbol,
-                        vpin=signal.vpin_value,
-                        z_score=signal.z_score,
-                        absorption=signal.absorption_detected,
-                        bar_close_price=float(bar.close),
-                        bar_volume_usd=float(bar.volume_usd),
-                        detected_at=now,
-                    )
-                    await self._dispatch_alert(alert)
-                else:
-                    remaining = self._debouncer.remaining_sec(symbol, now)
-                    logger.debug(
-                        f"🔕 [RADAR] {symbol} anomaly suppressed (cooldown {remaining:.0f}s left)"
-                    )
-
-        return _on_bar_closed
-
-    # ──────────────────────────────────────────────
-    # PRIVATE: Alert Formatting & Dispatch
-    # ──────────────────────────────────────────────
-
-    async def _dispatch_alert(self, alert: AnomalyAlert) -> None:
-        """Format and send Telegram alert for detected anomaly."""
-
-        # Direction hint based on absorption
-        if alert.absorption:
-            direction = "🧊 ICEBERG (Скрытый игрок поглощает)"
-            emoji = "🔴"
-        else:
-            direction = "⚡ Агрессивный дисбаланс"
-            emoji = "🟡"
-
-        z_bar = "█" * min(10, int(abs(alert.z_score)))
-
-        message = (
-            f"{emoji} <b>[АНОМАЛИЯ] {alert.symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <b>VPIN:</b> <code>{alert.vpin:.4f}</code>\n"
-            f"📈 <b>Z-Score:</b> <code>{alert.z_score:+.2f}</code> {z_bar}\n"
-            f"🎯 <b>Тип:</b> {direction}\n"
-            f"💰 <b>Цена:</b> <code>${alert.bar_close_price:,.4f}</code>\n"
-            f"📦 <b>Объём бара:</b> <code>${alert.bar_volume_usd:,.0f}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <i>Advisory Only — не является торговой рекомендацией</i>"
-        )
-
-        try:
-            await self._tg_notify(message, "ANOMALY")
-            logger.success(
-                f"🎯 [RADAR] ALERT FIRED: {alert.symbol} | "
-                f"VPIN={alert.vpin:.4f} | Z={alert.z_score:+.2f} | "
-                f"Absorption={alert.absorption}"
+    async def _on_bar_closed(self, bar: DollarBar) -> None:
+        self._bar_count += 1
+        engine = self._vpin_engines.get(bar.symbol)
+        if engine is None:
+            engine = O1VPINEngine(
+                window_size=self._window_size,
+                volume_threshold=float(self.threshold_usd),
+                z_threshold=self._z_threshold,
+                z_history_size=self._z_history_size,
             )
-        except Exception as e:
-            logger.error(f"❌ [RADAR] Failed to dispatch alert for {alert.symbol}: {e}")
+            self._vpin_engines[bar.symbol] = engine
+            logger.info(
+                f"[RadarPipeline] Spawned VPIN engine for {bar.symbol} "
+                f"(window={self._window_size}, z_thresh={self._z_threshold})"
+            )
 
-        # Persist to DB if available
-        if self._db_push:
-            try:
-                await self._db_push(
-                    "INSERT INTO signals (signal_id, symbol, state, entry_bid, exit_vpin, created_at) "
-                    "VALUES (:sig_id, :symbol, 'ANOMALY', :price, :vpin, CURRENT_TIMESTAMP)",
-                    {
-                        "sig_id": f"RADAR-{alert.symbol}-{int(alert.detected_at)}",
-                        "symbol": alert.symbol,
-                        "price": alert.bar_close_price,
-                        "vpin": alert.vpin,
-                    }
-                )
-            except Exception as e:
-                logger.error(f"❌ [RADAR] DB persist failed: {e}")
+        signal: VPINSignal | None = engine.process_bar(bar)
+        if signal is None:
+            return
+
+        self._signal_count += 1
+        if not signal.is_anomaly:
+            return
+
+        if not self._rate_limiter.allow(bar.symbol):
+            logger.debug(
+                f"[RadarPipeline] Suppressed alert for {bar.symbol} "
+                f"(rate-limited; z={signal.z_score:.2f})"
+            )
+            return
+
+        await self._dispatch_alert(bar, signal)
+
+    async def _dispatch_alert(self, bar: DollarBar, signal: VPINSignal) -> None:
+        alert = RadarAlert(
+            symbol=bar.symbol,
+            timestamp=bar.end_ts,
+            bar_open=float(bar.open),
+            bar_close=float(bar.close),
+            vpin=signal.vpin_value,
+            z_score=signal.z_score,
+            direction=signal.direction,
+            absorption=signal.absorption_detected,
+        )
+        try:
+            await self._alert_sink(alert)
+            self._alert_count += 1
+            logger.success(
+                f"[RadarPipeline] ALERT {alert.symbol} {alert.direction.upper()} "
+                f"z={alert.z_score:.2f} vpin={alert.vpin:.4f} "
+                f"absorption={alert.absorption}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Never let a failed alert poison the pipeline. Log and move on.
+            logger.error(
+                f"[RadarPipeline] Failed to dispatch alert for {alert.symbol}: {exc!r}"
+            )
+
+    async def _dispatch_liquidity_alert(self, alert: LiquidityAlert) -> None:
+        try:
+            await self._liquidity_alert_sink(alert)
+            self._liquidity_alert_count += 1
+            logger.success(
+                f"[RadarPipeline] LIQUIDITY {alert.kind} {alert.symbol} "
+                f"{alert.direction.upper()} notional=${alert.notional_usd:,.0f}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                f"[RadarPipeline] Failed to dispatch liquidity alert "
+                f"{alert.kind} for {alert.symbol}: {exc!r}"
+            )
+
+    @staticmethod
+    def _default_liquidity_sink(
+        vpin_sink: AlertSink,
+    ) -> LiquidityAlertSink:
+        """Default fan-in: shape a LiquidityAlert into a RadarAlert and
+        push it through the same outbox channel. Lets callers wire up
+        liquidity detectors without supplying a separate sink.
+        """
+
+        async def sink(la: LiquidityAlert) -> None:
+            ra = RadarAlert(
+                symbol=la.symbol,
+                timestamp=la.timestamp,
+                bar_open=la.price,
+                bar_close=la.price,
+                vpin=0.0,
+                z_score=float(la.extra.get("ratio_to_median", 0.0))
+                if la.kind == "OFI_PULSE"
+                else 0.0,
+                direction="long" if la.direction == "buy" else "short",
+                absorption=False,
+            )
+            await vpin_sink(ra)
+
+        return sink

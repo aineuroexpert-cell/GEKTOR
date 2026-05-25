@@ -114,17 +114,52 @@ class TelegramRadarNotifier:
         logger.info("📡 [Telegram] Secure tunnel initialized. PSR Protocol ARMED.")
 
     async def _process_worker(self):
-        """[GEKTOR v5.25] Nuclear-Isolated Egress. No network exception escapes."""
+        """[GEKTOR v5.25] Nuclear-Isolated Egress. No network exception escapes.
+
+        v3.6.0: proxy handling normalised so that SOCKS5 actually works.
+        Previously the code created a *plain* ClientSession and passed
+        ``proxy=self.proxy_url`` as a per-request kwarg. aiohttp's ``proxy=``
+        kwarg only understands ``http://`` and ``https://`` schemes — passing
+        a ``socks5://`` URL produced the cryptic
+        "TLS in TLS is disabled in stdlib asyncio" warning and silent failures.
+        We now select the connector by scheme: ``ProxyConnector`` from
+        ``aiohttp_socks`` for ``socks4://`` / ``socks5://`` / ``socks5h://``,
+        and the request-level ``proxy=`` kwarg for plain HTTP(S) proxies.
+        """
         import aiohttp
         from aiohttp_socks import ProxyConnector
+
+        socks_proxy: bool = bool(
+            self.proxy_url
+            and self.proxy_url.lower().startswith(("socks4://", "socks5://", "socks5h://"))
+        )
+        http_proxy_kwarg: Optional[str] = (
+            self.proxy_url
+            if (self.proxy_url and not socks_proxy)
+            else None
+        )
 
         while self._running:
             # --- SESSION CREATION (with proxy fallback) ---
             client_timeout = aiohttp.ClientTimeout(total=3.0, connect=2.0)
             try:
                 if self.proxy_url:
-                    logger.info(f"🌐 [Telegram] Egress routed via Proxy: {self.proxy_url[:32]}...")
-                async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                    proxy_scheme = self.proxy_url.split("://", 1)[0]
+                    logger.info(
+                        f"🌐 [Telegram] Egress routed via {proxy_scheme.upper()} proxy: "
+                        f"{self.proxy_url[:32]}..."
+                    )
+
+                # Connector path: SOCKS proxies need a transport-level connector;
+                # HTTP(S) proxies use the per-request `proxy=` kwarg below.
+                if socks_proxy:
+                    connector = ProxyConnector.from_url(self.proxy_url)
+                else:
+                    connector = aiohttp.TCPConnector()
+
+                async with aiohttp.ClientSession(
+                    timeout=client_timeout, connector=connector
+                ) as session:
                     self._session = session
                     while self._running:
                         alert_type = "UNKNOWN"
@@ -140,7 +175,7 @@ class TelegramRadarNotifier:
                             payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
                             try:
                                 async with asyncio.timeout(3.0):
-                                    async with session.post(self.api_url, json=payload, proxy=self.proxy_url) as resp:
+                                    async with session.post(self.api_url, json=payload, proxy=http_proxy_kwarg) as resp:
                                         if resp.status != 200:
                                             err_body = await resp.text()
                                             logger.error(f"⚠️ [TG_API] Dispatch Error {resp.status}: {err_body}")
