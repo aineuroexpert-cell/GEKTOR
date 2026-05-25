@@ -32,7 +32,7 @@
 
 1. Прочитать SSOT (если ещё не читал).
 2. Проверить через `grep -rn` / `git ls-files`, что упоминаемые в коде классы/файлы реально существуют. Нет ссылок на TradeSweeper / Aegis / NerveCenter / Stealth CUSUM — этого в коде НЕТ.
-3. Прогнать `.venv/bin/python -m pytest tests/regression tests/test_vpin_engine.py -q`. Должно быть `54+ passed` (v3.6.2 ожидаемо `64+ passed` с liquidity-detectors).
+3. Прогнать `.venv/bin/python -m pytest tests/regression tests/test_vpin_engine.py -q`. Базлайн v3.6.2: **83 passed** (радар-контур). Падения = сломали инвариант, фиксим в том же PR.
 4. Никаких секретов в коммите. `.env` в `.gitignore`. Bot token живёт только в `.env.production` на VPS.
 
 ## Стек (короткой строкой)

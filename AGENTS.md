@@ -68,7 +68,7 @@ Before declaring work done:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Expected baseline: **68+ passed, 8 skipped** (the 8 skipped are
+Expected baseline (v3.6.2 radar contour): `.venv/bin/python -m pytest tests/regression tests/test_vpin_engine.py -q` → **83 passed, 39 warnings**. Wider `tests/` suite includes legacy modules out of the radar scope (the 8 skipped/failing are
 documented out-of-scope subsystems — see SSOT §8).
 
 If your change adds new behaviour, write at least one regression test
