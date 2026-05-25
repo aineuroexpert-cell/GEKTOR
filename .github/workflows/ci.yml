@@ -22,34 +22,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           # Match the local dev environment: numpy, sqlalchemy, hypothesis,
           # aiosqlite, loguru, orjson, aiohttp, pydantic, pytest stack.
+          # Updated for Python 3.13 compatibility (v3.6.2)
           pip install \
-            "numpy==1.26.2" \
-            "SQLAlchemy==2.0.23" \
-            "pydantic==2.5.2" \
-            "pydantic-settings==2.1.0" \
+            "numpy==2.4.2" \
+            "SQLAlchemy==2.0.31" \
+            "pydantic==2.12.5" \
+            "pydantic-settings==2.6.1" \
             "python-dotenv>=1.0.0" \
-            "orjson>=3.9.10" \
+            "orjson==3.11.7" \
             "loguru==0.7.2" \
             "msgspec==0.18.5" \
-            "aiohttp[speedups]==3.9.1" \
+            "aiohttp[speedups]==3.11.2" \
+            "aiohttp-socks==0.11.0" \
             "pyyaml==6.0.1" \
             "redis==5.0.1" \
-            "aiohttp-socks==0.8.4" \
             "asyncpg==0.29.0" \
-            "aiosqlite>=0.19" \
+            "aiosqlite==0.21.0" \
             "hypothesis>=6.100" \
-            "pytest==7.4.3" \
-            "pytest-asyncio==0.23.2" \
+            "pytest==8.4.2" \
+            "pytest-asyncio==0.23.8" \
+            "pytest-cov==7.0.0" \
+            "pytest-mock==3.15.1" \
             "freezegun==1.2.2"
 
       - name: Run pytest (radar contour)
@@ -69,15 +72,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Install lint tooling
         run: |
           python -m pip install --upgrade pip
           pip install "ruff==0.1.7"
+
+      - name: Check for silent failures (except Exception pass)
+        run: |
+          # Block any "except Exception: pass" in radar contour
+          if grep -rn "except Exception:\s*pass" src/ main.py tests/regression/ 2>/dev/null; then
+            echo "❌ REJECTED: Silent failure detected (except Exception: pass)"
+            echo "Use specific exceptions with logging instead."
+            exit 1
+          fi
+          echo "✅ No silent failures detected"
+
+      - name: Check for hardcoded Telegram tokens
+        run: |
+          # Block accidental commits of BOT_TOKEN literals
+          if grep -rE "BOT_TOKEN=[0-9]+:[A-Za-z0-9_-]{35,}" . 2>/dev/null; then
+            echo "❌ REJECTED: BOT_TOKEN literal detected"
+            echo "Move it to .env.production on the VPS."
+            exit 1
+          fi
+          echo "✅ No hardcoded tokens detected"
 
       - name: Lint radar contour with ruff
         run: |
