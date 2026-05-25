@@ -1,0 +1,83 @@
+# ═══════════════════════════════════════════════════════════════
+# GEKTOR APEX .gitignore — Institutional Security Perimeter
+# ═══════════════════════════════════════════════════════════════
+
+# ─── SECRET SAUCE (PROPRIETARY ALPHA — NEVER COMMIT) ─────────
+secrets/
+alpha_weights.json
+config.yaml
+*.env
+.env.*
+!.env.example
+
+# ─── Python Runtime ──────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# ─── SHM / IPC Artifacts ────────────────────────────────────
+*.shm
+*.mmap
+
+# ─── State & Persistence ────────────────────────────────────
+*.db
+*.sqlite3
+*.db-wal
+*.db-shm
+emergency_dump.jsonl
+emergency_state_dump.jsonl
+failed_alerts.jsonl
+dump.rdb
+/blackbox/
+
+# ─── Node ────────────────────────────────────────────────────
+node_modules/
+
+# ─── OS ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── IDE ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Logs ────────────────────────────────────────────────────
+*.log
+/logs/
+
+# ─── AI & Memory ─────────────────────────────────────────────
+models/
+memory/
+gerald_workspace/tmp_run/
+gerald-memory/
+.openclaw/
+.agent/
+.gemini/
+
+# ─── Bridge Temp ─────────────────────────────────────────────
+bridge/inbox/*.md
+bridge/outbox/*.md
+!bridge/inbox/.gitkeep
+!bridge/outbox/.gitkeep
+!bridge/shared-context/.gitkeep
+
+# ─── Generated Artifacts ─────────────────────────────────────
+reports/
+plots/
+test_results/
+results/
+/scratch/
+/artifacts/
+/knowledge/
+scripts/.index_state.json
+
+_archive_quarantine/

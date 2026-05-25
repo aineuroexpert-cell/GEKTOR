@@ -1,0 +1,53 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(legacy/|docs/.*\.md$)
+      - id: end-of-file-fixer
+        exclude: ^(legacy/|docs/.*\.md$)
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: check-toml
+
+  - repo: local
+    hooks:
+      - id: no-telegram-token
+        name: Block accidental commits of Telegram bot token
+        entry: bash -c 'if git diff --cached | grep -qE "BOT_TOKEN=[0-9]+:[A-Za-z0-9_-]{35,}"; then echo "REJECTED: BOT_TOKEN literal detected in diff. Move it to .env.production on the VPS."; exit 1; fi'
+        language: system
+        pass_filenames: false
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.7
+    hooks:
+      - id: ruff
+        # Enforce lint on the entire radar contour (all files reachable from main.py)
+        files: ^(src/(domain|application|infrastructure|shared)/.*\.py|main\.py|tests/regression/.*\.py)$
+        args: ["--fix"]
+        exclude: ^src/(domain|application|infrastructure)/(alpha_decay|dead_mans_switch|defender|operator_gate|quarantine|reconnect_reconciler|runtime_guardian|sentinel|sentinel_watchdog|sentry_brain|state_healer|supervisor|vanguard|alpha_model|cortex|dollar_bar|dollar_bars|friction_guard|gravitational_anchor|intent_capsule|intent_ledger|macro_regime|markets|math_core|quant_radar|schrodinger_ledger|scoring|shadow_ledger|state_snapshoter|tilt_breaker|triple_barrier|gektor_l2)\.py$
+
+  - repo: local
+    hooks:
+      - id: no-silent-failures
+        name: Block silent failures (except Exception pass)
+        entry: bash -c 'if git diff --cached --name-only | xargs grep -l "except Exception:\s*pass" 2>/dev/null | grep -E "^(src/|main\.py)"; then echo "REJECTED: Silent failure detected (except Exception: pass). Use specific exceptions with logging."; exit 1; fi'
+        language: system
+        pass_filenames: false
+
+      - id: pytest-radar-fast
+        name: Run radar regression tests (fast)
+        entry: python -m pytest tests/regression/ tests/test_vpin_engine.py -q --tb=short -x
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: pytest-radar-full
+        name: Run full radar test suite
+        entry: python -m pytest tests/regression/ tests/test_vpin_engine.py -v
+        language: system
+        pass_filenames: false
+        stages: [manual]

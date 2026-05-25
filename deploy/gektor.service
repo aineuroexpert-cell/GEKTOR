@@ -1,0 +1,39 @@
+[Unit]
+Description=GEKTOR APEX HFT Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gektor/current
+# No .env files exposed. Environment variables should be managed via systemd overrides or secure vault.
+Environment=PYTHONUNBUFFERED=1
+
+# Run using the atomically swapped symlink release environment
+ExecStart=/opt/gektor/current/venv/bin/python /opt/gektor/current/main.py
+
+# Send SIGHUP to trigger internal Python hot-reloads via os.execv
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Аппаратный приоритет
+Nice=-20
+OOMScoreAdjust=-1000
+
+# Разрешение на mlock
+LimitMEMLOCK=infinity
+LimitNOFILE=65535
+
+# Привязка к неизолированным ядрам для служебных потоков 
+CPUAffinity=0 1
+
+# Журналирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gektor
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

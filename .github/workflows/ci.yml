@@ -1,0 +1,92 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+# CI scope (v3.6.0 APEX-RADAR):
+# - pytest: the single source of truth for "is the radar working?".
+#   Every invariant has a sentinel test under tests/regression/.
+# - lint: enforced ONLY on the radar contour (src/domain/, src/application/,
+#   tests/regression/, main.py). The legacy L2/RAG subsystems carry
+#   thousands of pre-existing lint findings; cleaning those is out of
+#   scope for this PR. They will be wrapped into a follow-up sweep.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Match the local dev environment: numpy, sqlalchemy, hypothesis,
+          # aiosqlite, loguru, orjson, aiohttp, pydantic, pytest stack.
+          pip install \
+            "numpy==1.26.2" \
+            "SQLAlchemy==2.0.23" \
+            "pydantic==2.5.2" \
+            "pydantic-settings==2.1.0" \
+            "python-dotenv>=1.0.0" \
+            "orjson>=3.9.10" \
+            "loguru==0.7.2" \
+            "msgspec==0.18.5" \
+            "aiohttp[speedups]==3.9.1" \
+            "pyyaml==6.0.1" \
+            "redis==5.0.1" \
+            "aiohttp-socks==0.8.4" \
+            "asyncpg==0.29.0" \
+            "aiosqlite>=0.19" \
+            "hypothesis>=6.100" \
+            "pytest==7.4.3" \
+            "pytest-asyncio==0.23.2" \
+            "freezegun==1.2.2"
+
+      - name: Run pytest (radar contour)
+        env:
+          # The only strictly required setting is ASYNC_DATABASE_URL. Bybit
+          # API keys are now optional (Advisory radar uses public WS only),
+          # and Telegram credentials are optional too. Tests use a mocked WS
+          # and in-memory SQLite — no real network calls.
+          ASYNC_DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+        run: |
+          python -m pytest tests/ -q --tb=short
+
+  lint-radar-contour:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lint tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ruff==0.1.7"
+
+      - name: Lint radar contour with ruff
+        run: |
+          ruff check \
+            src/domain/vpin_engine.py \
+            src/domain/conflation.py \
+            src/application/radar_pipeline.py \
+            src/application/watchdog.py \
+            src/application/outbox_alert_sink.py \
+            src/application/outbox_relay.py \
+            src/application/formatters.py \
+            tests/regression/

@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # ЦЕНТРАЛЬНОЕ ЯДРО: GEKTOR APEX Trading Daemon
+  gektor_core:
+    build: .
+    container_name: gektor_core_apex
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://tekton_admin:${POSTGRES_PASSWORD}@blackbox_db/tekton_alpha
+      - REDIS_URL=redis://nerve_center/0
+    volumes:
+      # [TWO-TIER TIME SYNC] Жесткая привязка к часам хоста
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    depends_on:
+      - blackbox_db
+      - nerve_center
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m" # Лимит логов на диск
+        max-file: "3"
+
+  # ХРАНИЛИЩЕ: TimescaleDB (Postgres 16)
+  blackbox_db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: gektor_blackbox
+    restart: always
+    environment:
+      - POSTGRES_USER=tekton_admin
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=tekton_alpha
+    ports:
+      - "127.0.0.1:5433:5432"
+    cpuset: "0-1"
+    volumes:
+      - gektor_pgdata:/var/lib/postgresql/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
+
+  # ШИНА: Redis (Hardened Persistence)
+  nerve_center:
+    image: redis:7-alpine
+    container_name: gektor_nerve_center
+    restart: always
+    command: redis-server --appendonly yes --appendfsync everysec --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - gektor_redis_data:/data
+
+volumes:
+  gektor_pgdata:
+  gektor_redis_data:
+
