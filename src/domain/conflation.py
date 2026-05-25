@@ -64,11 +64,39 @@ class IBarAggregator(Protocol):
 class DollarBarEngine(IBarAggregator):
     """
     Машина сборки Dollar Bars.
+
+    v3.6.2: optional per-symbol threshold provider. When supplied, the
+    threshold is looked up on each closing-check by calling
+    `threshold_provider(symbol)`. The fallback `threshold_usd` is used
+    when the provider returns None or 0 (e.g. unknown symbol before the
+    first turnover refresh).
     """
-    def __init__(self, threshold_usd: Decimal):
+    def __init__(
+        self,
+        threshold_usd: Decimal,
+        threshold_provider: Callable[[str], Decimal] | None = None,
+    ):
+        if threshold_usd <= 0:
+            raise ValueError("threshold_usd must be > 0")
         self.threshold_usd = threshold_usd
+        self._threshold_provider = threshold_provider
         self._current_bars: dict[str, DollarBar] = {}
         self._on_bar_closed: Callable[[DollarBar], Awaitable[None]] | None = None
+
+    def _threshold_for(self, symbol: str) -> Decimal:
+        if self._threshold_provider is None:
+            return self.threshold_usd
+        try:
+            val = self._threshold_provider(symbol)
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning(
+                f"[CONFLATION] threshold_provider failed for {symbol}: {exc!r}; "
+                f"using base {self.threshold_usd}"
+            )
+            return self.threshold_usd
+        if val is None or val <= 0:
+            return self.threshold_usd
+        return val
 
     def set_callback(self, callback: Callable[[DollarBar], Awaitable[None]]) -> None:
         self._on_bar_closed = callback
@@ -113,8 +141,8 @@ class DollarBarEngine(IBarAggregator):
             # Maker был продавцом, значит Taker купил по Ask
             bar.buy_volume_usd += tick_usd
 
-        # Каузальный триггер: порог долларов превышен
-        if bar.volume_usd >= self.threshold_usd:
+        # Каузальный триггер: per-symbol $-порог (v3.6.2 — adaptive)
+        if bar.volume_usd >= self._threshold_for(symbol):
             bar.end_ts = exchange_ts
 
             # 1. Извлекаем готовый бар

@@ -1,18 +1,28 @@
 import asyncio
-import sys
-import signal
 import logging
 import os
-from decimal import Decimal
-from typing import NoReturn, Optional
+import signal
+import sys
 from datetime import datetime, timezone
+from decimal import Decimal
+from typing import NoReturn
 
 from src.application.outbox_alert_sink import OutboxAlertSink
 from src.application.radar_pipeline import RadarPipeline
 from src.application.watchdog import PartialBlindnessWatchdog
+from src.domain.liquidity_detectors import (
+    LargePrintDetector,
+    LiquidityDetectorBank,
+    OFIPulseDetector,
+    SweepDetector,
+)
+from src.infrastructure.adaptive_threshold import (
+    AdaptiveDollarThresholdProvider,
+    adaptive_threshold_refresher,
+)
 from src.infrastructure.bybit import BybitRestClient
 from src.infrastructure.bybit_ws_ingestion import BybitWSIngestion
-from src.infrastructure.config import settings
+from src.infrastructure.config import resolve_sensitivity, settings
 from src.infrastructure.database import DatabaseManager
 from src.infrastructure.telegram_notifier import TelegramRadarNotifier
 from src.shared.alpha_config import alpha
@@ -37,7 +47,7 @@ class GektorRadarCore:
     def __init__(self, env: str = "local"):
         self.env = env
         self._is_running = False
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.db = DatabaseManager()
         self.tg = TelegramRadarNotifier(
             db_manager=self.db,
@@ -53,17 +63,110 @@ class GektorRadarCore:
         self.outbox_repo = OutboxRepository(self.db)
         self.outbox_relay = TelegramRelayWorker(repo=self.outbox_repo, tg_client=self.tg)
 
-        # --- Quantitative core (v3.6.0 APEX-RADAR) ---
-        self.bybit_rest = BybitRestClient(proxy_url=settings.PROXY_URL if settings.USE_PROXY_FOR_BYBIT else None)
-        threshold_usd_env = float(os.getenv("DOLLAR_THRESHOLD_BASE", "100000"))
+        # --- Quantitative core (v3.6.2 APEX-RADAR) ---
+        self.bybit_rest = BybitRestClient(
+            proxy_url=settings.PROXY_URL if settings.USE_PROXY_FOR_BYBIT else None
+        )
+
+        # Sensitivity tier translation (v3.6.2). Operator picks one of
+        # conservative|active|scanner in .env; we resolve to concrete
+        # radar params here. AlphaConfig overrides take precedence if
+        # the operator has tuned them manually (alpha.VPIN_ANOMALY_Z != 0).
+        tier = resolve_sensitivity(settings.SENSITIVITY)
+        z_threshold = (
+            alpha.VPIN_ANOMALY_Z if alpha.VPIN_ANOMALY_Z else float(tier["z_threshold"])
+        )
+        vpin_window = (
+            alpha.VPIN_WINDOW_SIZE
+            if alpha.VPIN_WINDOW_SIZE
+            else int(tier["vpin_window"])
+        )
+        cooldown_sec = float(
+            os.getenv("RADAR_COOLDOWN_SEC", str(tier["cooldown_sec"]))
+        )
+        logger.info(
+            f"[CONFIG] Sensitivity tier='{settings.SENSITIVITY}' resolved to "
+            f"z={z_threshold}, window={vpin_window}, cooldown={cooldown_sec}s"
+        )
+
+        threshold_usd_env = float(
+            os.getenv("DOLLAR_THRESHOLD_BASE", str(settings.DOLLAR_THRESHOLD_BASE))
+        )
+
+        # Adaptive per-symbol dollar threshold provider (v3.6.2).
+        # Empty cache until first refresh() call; threshold_for() falls
+        # back to threshold_usd_env until then.
+        self.threshold_provider: AdaptiveDollarThresholdProvider | None = None
+        if settings.ADAPTIVE_THRESHOLD_ENABLE:
+            self.threshold_provider = AdaptiveDollarThresholdProvider(
+                rest_client=self.bybit_rest,
+                target_bars_per_day=settings.ADAPTIVE_TARGET_BARS_PER_DAY,
+                min_usd=settings.ADAPTIVE_MIN_USD,
+                max_usd=settings.ADAPTIVE_MAX_USD,
+                default_usd=threshold_usd_env,
+            )
+            logger.info(
+                "[CONFIG] Adaptive threshold provider enabled "
+                f"(target_bars/day={settings.ADAPTIVE_TARGET_BARS_PER_DAY}, "
+                f"min=${settings.ADAPTIVE_MIN_USD:,.0f}, "
+                f"max=${settings.ADAPTIVE_MAX_USD:,.0f})"
+            )
+
+        # Liquidity detectors (instant-fire, no warmup) — v3.6.2.
+        self.liquidity_bank: LiquidityDetectorBank | None = None
+        if settings.LIQUIDITY_DETECTORS_ENABLE:
+            sweep = SweepDetector(
+                min_trades=settings.SWEEP_MIN_TRADES,
+                window_sec=settings.SWEEP_WINDOW_SEC,
+                min_notional_usd=settings.SWEEP_MIN_NOTIONAL_USD,
+                cooldown_sec=cooldown_sec,
+            )
+            # LargePrintDetector needs a turnover provider. If adaptive
+            # threshold provider is on, reuse its cache; else stub returns 0
+            # which makes the detector use the absolute floor only.
+            if self.threshold_provider is not None:
+                turnover_provider = self.threshold_provider.turnover_for
+            else:
+                def turnover_provider(_symbol: str) -> float:
+                    return 0.0
+
+            large_print = LargePrintDetector(
+                turnover_provider=turnover_provider,
+                pct_threshold=settings.LARGE_PRINT_PCT_THRESHOLD,
+                min_notional_usd=settings.LARGE_PRINT_MIN_NOTIONAL_USD,
+                cooldown_sec=cooldown_sec,
+            )
+            ofi_pulse = OFIPulseDetector(
+                bucket_sec=settings.OFI_PULSE_BUCKET_SEC,
+                history_buckets=settings.OFI_PULSE_HISTORY_BUCKETS,
+                k=settings.OFI_PULSE_K,
+                min_notional_usd=settings.OFI_PULSE_MIN_NOTIONAL_USD,
+                cooldown_sec=cooldown_sec * 2.0,
+            )
+            self.liquidity_bank = LiquidityDetectorBank(
+                sweep=sweep,
+                large_print=large_print,
+                ofi_pulse=ofi_pulse,
+            )
+            logger.info(
+                "[CONFIG] Liquidity detectors enabled: "
+                f"Sweep(N={settings.SWEEP_MIN_TRADES}, ${settings.SWEEP_MIN_NOTIONAL_USD:,.0f}) "
+                f"LargePrint({settings.LARGE_PRINT_PCT_THRESHOLD * 100:.2f}% of 24h) "
+                f"OFI Pulse(k={settings.OFI_PULSE_K})"
+            )
+
         self.alert_sink = OutboxAlertSink(self.db)
         self.radar = RadarPipeline(
             threshold_usd=Decimal(str(threshold_usd_env)),
             alert_sink=self.alert_sink,
-            window_size=alpha.VPIN_WINDOW_SIZE,
-            z_threshold=alpha.VPIN_ANOMALY_Z if alpha.VPIN_ANOMALY_Z else 2.5,
+            window_size=vpin_window,
+            z_threshold=z_threshold,
             z_history_size=500,
-            per_symbol_cooldown_sec=float(os.getenv("RADAR_COOLDOWN_SEC", "300")),
+            per_symbol_cooldown_sec=cooldown_sec,
+            threshold_provider=(
+                self.threshold_provider.threshold_for if self.threshold_provider else None
+            ),
+            liquidity_detectors=self.liquidity_bank,
         )
         self._ws_tasks: list[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
@@ -71,7 +174,8 @@ class GektorRadarCore:
         async def _watchdog_sink(kind: str, metrics: dict) -> None:
             """Bridge watchdog events to the operator via the existing Outbox."""
             try:
-                from datetime import datetime, timezone as _tz
+                from datetime import datetime
+                from datetime import timezone as _tz
                 payload_text = (
                     "⚠️ <b>[GEKTOR APEX] PARTIAL BLINDNESS</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -120,6 +224,21 @@ class GektorRadarCore:
         """
         logger.info("[RADAR ENGINE] Поиск среднесрочных аномалий активирован.")
 
+        # v3.6.2: prime the adaptive threshold cache BEFORE listing
+        # symbols, so the first bars closed already use per-symbol
+        # sizing. A failure here is non-fatal — provider will fall back
+        # to the base threshold and the next refresh tick can recover.
+        if self.threshold_provider is not None:
+            await self.threshold_provider.refresh()
+            asyncio.create_task(
+                adaptive_threshold_refresher(
+                    self.threshold_provider,
+                    interval_sec=settings.ADAPTIVE_REFRESH_SEC,
+                    stop_event=self._shutdown_event,
+                ),
+                name="adaptive_threshold_refresher",
+            )
+
         symbols = await self.bybit_rest.fetch_active_symbols()
         if not symbols:
             logger.error("[RADAR ENGINE] Discovery вернул пустой список — радар не запустится.")
@@ -145,19 +264,20 @@ class GektorRadarCore:
             logger.info(
                 f"[RADAR METRICS] ticks={m['tick_count']} bars={m['bar_count']} "
                 f"signals={m['signal_count']} alerts={m['alert_count']} "
+                f"liq_alerts={m['liquidity_alert_count']} "
                 f"symbols={m['symbols_tracked']}"
             )
 
     async def startup(self) -> None:
         self._is_running = True
         logger.info("[SYSTEM] Инициализация GEKTOR APEX (Advisory Mode)...")
-        
+
         # Инициализация DatabaseManager (WAL)
         await self.db.initialize()
-        
+
         # Инициализация Telegram-нотифиера
         await self.tg.start()
-        
+
         # Отправка стартового оповещения
         await self.tg.notify_manual(
             "🟢 <b>[GEKTOR APEX] Система выведена на орбиту</b>\n"
@@ -169,7 +289,7 @@ class GektorRadarCore:
             "✅ <b>СТАТУС: МОНИТОРИНГ ЗАПУЩЕН</b>",
             "STARTUP"
         )
-        
+
         # Запуск подсистем конкурентно
         await asyncio.gather(
             self._alert_engine(),
@@ -188,7 +308,7 @@ class GektorRadarCore:
 
         # Останавливаем воркер релея
         self.outbox_relay.stop()
-        
+
         # Отправка оповещения о завершении
         await self.tg.notify_manual(
             f"🔴 <b>[GEKTOR APEX] Завершение работы</b>\n"
@@ -199,18 +319,21 @@ class GektorRadarCore:
             "🛑 <b>СТАТУС: СИСТЕМА ОСТАНОВЛЕНА</b>",
             "SHUTDOWN"
         )
-        
-        # Ожидаем завершения отправки алертов из очереди
+
+        # Ожидаем завершения отправки алертов из очереди.
+        # v3.6.2 фикс: asyncio.timeout() — это async context manager в Py3.11+,
+        # не функция-обёртка. Раньше вызов падал в TypeError, а
+        # `except Exception: pass` это маскировал — очередь не дожидалась.
         try:
-            await asyncio.timeout(3.0, self.tg._queue.join())
-        except Exception:
-            pass
+            await asyncio.wait_for(self.tg._queue.join(), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning("[SYSTEM] Telegram queue drain timed out (shutdown); some alerts may be lost.")
         await self.tg.stop()
         await self.db.close()
-        
+
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         [task.cancel() for task in tasks]
-        
+
         logger.info(f"[SYSTEM] Ожидание отмены {len(tasks)} фоновых задач...")
         await asyncio.gather(*tasks, return_exceptions=True)
         self._loop.stop()
@@ -219,10 +342,10 @@ class GektorRadarCore:
     async def hot_reload(self) -> None:
         logger.warning("[SYSTEM] Получен сигнал SIGHUP. Запуск Hot Reload...")
         self._is_running = False
-        
+
         # Останавливаем воркер релея
         self.outbox_relay.stop()
-        
+
         # Отправка оповещения о горячей перезагрузке
         await self.tg.notify_manual(
             "🔄 <b>[GEKTOR APEX] Горячая перезагрузка</b>\n"
@@ -233,21 +356,21 @@ class GektorRadarCore:
             "⏳ <b>СТАТУС: ПЕРЕЗАПУСК</b>",
             "SHUTDOWN"
         )
-        
-        # Ожидаем завершения отправки алертов из очереди
+
+        # Ожидаем завершения отправки алертов (см. комментарий в shutdown() выше).
         try:
-            await asyncio.timeout(3.0, self.tg._queue.join())
-        except Exception:
-            pass
+            await asyncio.wait_for(self.tg._queue.join(), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning("[SYSTEM] Telegram queue drain timed out (hot_reload); some alerts may be lost.")
         await self.tg.stop()
         await self.db.close()
-        
+
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         [task.cancel() for task in tasks]
-        
+
         logger.info(f"[SYSTEM] Ожидание отмены {len(tasks)} фоновых задач перед hot reload...")
         await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         logger.info("[SYSTEM] Перезапуск процесса через os.execv...")
         import os
         os.execv(sys.executable, [sys.executable] + sys.argv)

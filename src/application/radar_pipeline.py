@@ -35,6 +35,10 @@ from decimal import Decimal
 from loguru import logger
 
 from src.domain.conflation import DollarBar, DollarBarEngine
+from src.domain.liquidity_detectors import (
+    LiquidityAlert,
+    LiquidityDetectorBank,
+)
 from src.domain.vpin_engine import O1VPINEngine, VPINSignal
 
 
@@ -53,6 +57,8 @@ class RadarAlert:
 # Type for the side-effect callback that ships an alert to the outbox /
 # notifier. Kept simple so it can be a closure over a Telegram client.
 AlertSink = Callable[[RadarAlert], Awaitable[None]]
+LiquidityAlertSink = Callable[[LiquidityAlert], Awaitable[None]]
+ThresholdProvider = Callable[[str], Decimal]
 
 
 class _SymbolPerSymbolRateLimiter:
@@ -95,16 +101,24 @@ class RadarPipeline:
         z_threshold: float = 2.5,
         z_history_size: int = 500,
         per_symbol_cooldown_sec: float = 300.0,
+        threshold_provider: ThresholdProvider | None = None,
+        liquidity_detectors: LiquidityDetectorBank | None = None,
+        liquidity_alert_sink: LiquidityAlertSink | None = None,
     ) -> None:
         self.threshold_usd = threshold_usd
         self._alert_sink = alert_sink
         self._window_size = window_size
         self._z_threshold = z_threshold
         self._z_history_size = z_history_size
+        self._threshold_provider = threshold_provider
 
         # Shared DollarBarEngine — its internal `_current_bars` dict already
         # partitions by symbol, so a single instance handles the whole universe.
-        self._bar_engine: DollarBarEngine = DollarBarEngine(threshold_usd=threshold_usd)
+        # v3.6.2: per-symbol adaptive threshold provider can override the base.
+        self._bar_engine: DollarBarEngine = DollarBarEngine(
+            threshold_usd=threshold_usd,
+            threshold_provider=threshold_provider,
+        )
         self._bar_engine.set_callback(self._on_bar_closed)
 
         # One VPIN engine per symbol. Created lazily.
@@ -113,11 +127,16 @@ class RadarPipeline:
         # Per-symbol rate limiter to keep Telegram traffic civilised.
         self._rate_limiter = _SymbolPerSymbolRateLimiter(per_symbol_cooldown_sec)
 
+        # v3.6.2: optional instant-fire liquidity detectors (no warmup).
+        self._liquidity_detectors = liquidity_detectors
+        self._liquidity_alert_sink = liquidity_alert_sink or self._default_liquidity_sink(alert_sink)
+
         # Lightweight metrics (read by /health endpoint and tests).
         self._tick_count: int = 0
         self._bar_count: int = 0
         self._signal_count: int = 0
         self._alert_count: int = 0
+        self._liquidity_alert_count: int = 0
         self._last_tick_ts: float | None = None
 
     # ------------------------------------------------------------------
@@ -162,6 +181,25 @@ class RadarPipeline:
         """
         self._tick_count += 1
         self._last_tick_ts = exchange_ts
+
+        # v3.6.2: run instant-fire liquidity detectors BEFORE bar aggregation,
+        # so they can alert on raw ticks regardless of bar warmup state.
+        if self._liquidity_detectors is not None and self._liquidity_detectors.enabled:
+            liquidity_alerts = self._liquidity_detectors.process_tick(
+                symbol=symbol,
+                is_buyer_maker=is_buyer_maker,
+                price=float(price),
+                size=float(size),
+                ts=exchange_ts,
+            )
+            for alert in liquidity_alerts:
+                # Rate-limit liquidity alerts under the same per-symbol cooldown
+                # as VPIN alerts — prevents flooding when both fire on the same
+                # event. Use a derived key so Sweep and OFI Pulse don't shadow VPIN.
+                if not self._rate_limiter.allow(f"{alert.kind}:{alert.symbol}"):
+                    continue
+                await self._dispatch_liquidity_alert(alert)
+
         await self._bar_engine.process_tick(
             symbol=symbol,
             price=price,
@@ -185,6 +223,7 @@ class RadarPipeline:
             "bar_count": self._bar_count,
             "signal_count": self._signal_count,
             "alert_count": self._alert_count,
+            "liquidity_alert_count": self._liquidity_alert_count,
             "last_tick_ts": self._last_tick_ts,
             "symbols_tracked": len(self._vpin_engines),
         }
@@ -252,3 +291,45 @@ class RadarPipeline:
             logger.error(
                 f"[RadarPipeline] Failed to dispatch alert for {alert.symbol}: {exc!r}"
             )
+
+    async def _dispatch_liquidity_alert(self, alert: LiquidityAlert) -> None:
+        try:
+            await self._liquidity_alert_sink(alert)
+            self._liquidity_alert_count += 1
+            logger.success(
+                f"[RadarPipeline] LIQUIDITY {alert.kind} {alert.symbol} "
+                f"{alert.direction.upper()} notional=${alert.notional_usd:,.0f}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                f"[RadarPipeline] Failed to dispatch liquidity alert "
+                f"{alert.kind} for {alert.symbol}: {exc!r}"
+            )
+
+    @staticmethod
+    def _default_liquidity_sink(
+        vpin_sink: AlertSink,
+    ) -> LiquidityAlertSink:
+        """Default fan-in: shape a LiquidityAlert into a RadarAlert and
+        push it through the same outbox channel. Lets callers wire up
+        liquidity detectors without supplying a separate sink.
+        """
+
+        async def sink(la: LiquidityAlert) -> None:
+            ra = RadarAlert(
+                symbol=la.symbol,
+                timestamp=la.timestamp,
+                bar_open=la.price,
+                bar_close=la.price,
+                vpin=0.0,
+                z_score=float(la.extra.get("ratio_to_median", 0.0))
+                if la.kind == "OFI_PULSE"
+                else 0.0,
+                direction="long" if la.direction == "buy" else "short",
+                absorption=False,
+            )
+            await vpin_sink(ra)
+
+        return sink
