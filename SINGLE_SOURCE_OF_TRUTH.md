@@ -1,6 +1,10 @@
-# GEKTOR APEX — SINGLE SOURCE OF TRUTH (v3.6.0 APEX-RADAR)
+# GEKTOR APEX — SINGLE SOURCE OF TRUTH (v3.6.2 APEX-RADAR)
 
-> **Это единственный действующий манифест системы.** Все остальные документы (README v12.0, CLAUDE.md v2.0, CORE_MANIFESTO v7.0, LAUNCH_CONTEXT v3.0 и любые более ранние спецификации) **АРХИВНЫЕ** — их можно читать как историю, но при противоречиях с этим документом приоритет имеет он.
+> **Это единственный действующий манифест системы.** Все остальные документы (старые README v12.0, CLAUDE.md v2.0, CORE_MANIFESTO, LAUNCH_CONTEXT и любые более ранние спецификации) **АРХИВНЫЕ** — их можно читать как историю, но при противоречиях с этим документом приоритет имеет он.
+>
+> Детальный аудит кода вс. документации см. [`AUDIT_REPORT.md`](./AUDIT_REPORT.md).
+>
+> v3.6.2 добавляет: адаптивный per-symbol $-порог, SENSITIVITY-тиры, liquidity-detectors (Sweep / LargePrint / OFI Pulse). VPIN-ядро и инварианты I1–I5 не изменились.
 >
 > Любая ИИ-модель (архитектор, кодер, ревьюер), работающая в этом репозитории, **ОБЯЗАНА** прочитать этот файл первым. Если в коде или другом документе вы видите утверждение, противоречащее этому SSOT — это **галлюцинация** или **устаревший контур**; не следуйте ему.
 
@@ -23,27 +27,33 @@
 4. **Блокировки event loop запрещены.** CPU-bound математика выносится в `ProcessPoolExecutor` (для тяжёлых вычислений — не для горячего пути радара).
 5. **Изоляция символов запрещена.** Любой символ анализируется с обязательной привязкой к BTC/ETH macro-контексту (когда такая привязка будет введена в этой ветке развития — на v3.6.0 этого нет, но запрет действует на будущие изменения).
 
-## 3. Архитектура радара (v3.6.0 APEX-RADAR)
+## 3. Архитектура радара (v3.6.2 APEX-RADAR)
 
 ```
 Bybit WS  →  BybitWSIngestion (parse + polarity)
                   ↓ process_tick(symbol, price, size, is_buyer_maker, exchange_ts)
             RadarPipeline (per-symbol routing, metrics)
-                  ↓
-            DollarBarEngine.process_tick → close → on_bar_closed(bar)
-                  ↓
-            O1VPINEngine.process_bar(bar)  # O(1) ring buffer
-                  ↓ if is_anomaly:
-            PerSymbolRateLimiter.allow(symbol)
-                  ↓ if allowed:
-            OutboxAlertSink → INSERT INTO outbox_events (status=PENDING)
-                  ↓
-            TelegramRelayWorker (separate task)
-                  ↓ claim PENDING → notify → mark_delivered
-            TelegramRadarNotifier → Bybit user via @BotFather bot
+                  ├─ DollarBarEngine.process_tick → close → on_bar_closed(bar)
+                  │        ↓
+                  │   O1VPINEngine.process_bar(bar)  # O(1) ring buffer, вармап 50 баров
+                  │        ↓ if is_anomaly:
+                  │
+                  ├─ SweepDetector.process_tick      # мгновенно, без вармапа
+                  ├─ LargePrintDetector.process_tick # мгновенно
+                  └─ OFIPulseDetector.process_tick   # ~1 мин на медиану
+                          ↓ любой детектор выдал alert
+                  PerSymbolRateLimiter.allow(symbol)
+                          ↓ if allowed:
+                  OutboxAlertSink → INSERT INTO outbox_events (status=PENDING)
+                          ↓
+                  TelegramRelayWorker (separate task)
+                          ↓ claim PENDING → notify → mark_delivered
+                  TelegramRadarNotifier → оператор в Telegram
 ```
 
 Параллельный контур: `PartialBlindnessWatchdog` опрашивает `RadarPipeline.metrics()` каждые 10 секунд и эскалирует через тот же Outbox, если за 60 секунд не было ни одного тика.
+
+Адаптивный per-symbol $-порог: `AdaptiveDollarThresholdProvider` каждый час тянет 24h turnover всех символов через Bybit REST `/v5/market/tickers` и выдаёт порог = clamp(turnover_24h / target_bars_per_day, min_usd, max_usd). Это решает проблему tail-альтов, у которых при фикс-пороге $1M вармап занимал бы дни.
 
 ## 4. Канонические инварианты (НЕ нарушать)
 
@@ -74,26 +84,44 @@ Bybit WS  →  BybitWSIngestion (parse + polarity)
 | ORM | SQLAlchemy + async | 2.0.23 |
 | БД (default) | SQLite (WAL) | через aiosqlite |
 | БД (prod, опционально) | PostgreSQL | через asyncpg |
-| Очередь Redis | Redis Pub/Sub | 5.0.1 (для буфера ингестии, не для горячего пути радара) |
-| Логирование | loguru | 0.7.2 (structured JSON) |
+| Логирование | loguru | 0.7.2 (structured) |
 | Конфиг | pydantic-settings | 2.1.0 |
 | Тесты | pytest, pytest-asyncio, hypothesis | см. pyproject.toml |
 
+**Redis в радар-контуре v3.6.x НЕ используется.** Старые версии этого документа упоминали Redis как буфер ингестии — это была аспирация. `ReliableIngestionBuffer` существует в репо, но из `main.py` не вызывается. Радар работает полностью в in-process pipeline + SQLite outbox.
+
 ## 6. Конфигурация (`.env`)
 
-Минимальный набор переменных:
+Минимальный набор + новые v3.6.2 переменные (полный список — `.env.example`):
 
 ```
 BOT_TOKEN=<выдаёт @BotFather; ХРАНИТЬ ТОЛЬКО В .env.production НА VPS>
 CHAT_ID=<Telegram chat ID куда слать алерты>
 ASYNC_DATABASE_URL=sqlite+aiosqlite:///gektor.db
-REDIS_HOST=127.0.0.1
-REDIS_PORT=6379
-DOLLAR_THRESHOLD_BASE=100000             # Размер dollar bar в USD
-RADAR_COOLDOWN_SEC=300                   # Per-symbol cooldown
+
+# Чувствительность радара (v3.6.2)
+SENSITIVITY=active                       # conservative | active | scanner
+
+# Dollar-bar порог
+DOLLAR_THRESHOLD_BASE=1000000            # fallback для символов, в которых нет 24h turnover
+ADAPTIVE_THRESHOLD_ENABLE=true           # per-symbol адаптация по Bybit /v5/market/tickers
+ADAPTIVE_TARGET_BARS_PER_DAY=200         # целевая частота баров в день на символ
+ADAPTIVE_MIN_USD=20000                   # минимум per-symbol порога
+ADAPTIVE_MAX_USD=5000000                 # максимум
+
+# Cooldown / watchdog
+RADAR_COOLDOWN_SEC=300                   # Per-symbol cooldown между алертами
 WATCHDOG_SILENCE_SEC=60                  # Триггер PARTIAL_BLINDNESS
 WATCHDOG_POLL_SEC=10
 ```
+
+### Сенсорные тиры (v3.6.2)
+
+| Tier | `z_threshold` | `vpin_window` | `RADAR_COOLDOWN_SEC` | Ожидаемая частота |
+|---|---|---|---|---|
+| `conservative` | 2.5σ | 50 | 600 | 1-3 алерта в день (swing) |
+| **`active` (default)** | **2.0σ** | **50** | **300** | **5-15 алертов в день (intraday)** |
+| `scanner` | 1.7σ | 30 | 120 | 30-50 алертов в день (скаут) |
 
 **ТОКЕН TELEGRAM НЕ КОММИТИТЬ В РЕПОЗИТОРИЙ.** Если он засветился в чате — отзовите его через @BotFather и выпустите новый.
 
@@ -115,9 +143,11 @@ WATCHDOG_POLL_SEC=10
 Запуск:
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
-# Ожидаемый результат: 68+ passed, 8 skipped (out-of-scope подсистемы)
+.venv/bin/python -m pytest tests/regression tests/test_vpin_engine.py -q
+# Ожидаемый результат v3.6.2: 64+ passed (из них 54 — радар-контур v3.6.0+v3.6.1, ~10 новых — liquidity_detectors + adaptive_threshold).
 ```
+
+Остальные тесты в репо (`tests/test_intent_capsule.py`, `tests/test_sniper_*.py`, `tests/test_schrodinger_ledger.py`, `tests/unit/test_state_healer.py`, и др.) — **legacy**, импортируют орфан-модули. Не входят в контур здоровья радара v3.6.x. См. AUDIT_REPORT.md.
 
 ## 8. Out-of-scope подсистемы (помечены skip с явной причиной)
 
@@ -148,6 +178,8 @@ WATCHDOG_POLL_SEC=10
 
 | Версия | Дата | Изменения |
 |--------|------|-----------|
+| 3.6.2 APEX-RADAR | 2026-05-24 | Полный аудит репо (AUDIT_REPORT.md). Адаптивный per-symbol $-порог. SENSITIVITY-тиры. Liquidity-detectors (Sweep / LargePrint / OFI Pulse). Честная перепись README. |
+| 3.6.1 | 2026-05-24 | Tokyo deploy fixes: env aliases, optional Bybit keys, SQLite-aware pool. |
 | 3.6.0 APEX-RADAR | 2025-05-21 | VPIN hardening (I1-I5), RadarPipeline, Outbox SQL portability, watchdog, регрессионные + property тесты, SSOT |
 | 3.5.0 | прошлая итерация | Спецификация RadarPipeline (код не запушен) |
 | ... | ... | Архивная история — см. README_*.md / *_MANIFESTO.md |

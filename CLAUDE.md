@@ -1,57 +1,50 @@
-# 🛑 GEKTOR APEX: CORE ARCHITECTURE MANIFESTO (v2.0 STRICT) 🛑
+# GEKTOR APEX — Краткий манифест (для Claude / Cursor / любой ИИ-модели)
 
-# 🎯 MISSION & IDENTITY
-**GEKTOR — ЭТО ИСКЛЮЧИТЕЛЬНО АНАЛИТИЧЕСКИЙ РАДАР. ОН НЕ ТОРГУЕТ.**
-Система предназначена для поиска **среднесрочных аномалий** (Medium-Term) и скрытой институциональной аккумуляции.
+> Этот файл — **короткий pointer**. Полная архитектура и правила:
+> - [`SINGLE_SOURCE_OF_TRUTH.md`](./SINGLE_SOURCE_OF_TRUTH.md) — каноническая архитектура (приоритет над всем остальным).
+> - [`AGENTS.md`](./AGENTS.md) — правила для ИИ-агентов.
+> - [`AUDIT_REPORT.md`](./AUDIT_REPORT.md) — что реально работает, что галлюцинации, что планируется.
+> - [`README.md`](./README.md) — пользовательский обзор.
+>
+> При любом противоречии между этим файлом и SSOT — приоритет у SSOT.
 
-- **Status:** MISSION CONTROL [ACTIVE]
-- **Identity:** Analytical Radar (Advisory Only)
-- **Execution:** STRICTLY MANUAL (Operator via Telegram)
-- **Horizon:** 4h to 2w (Medium-Term)
+## Идентичность
 
----
+**GEKTOR APEX — это Advisory-only радар.** Он слушает Bybit, ищет аномалии ликвидности, шлёт алерты в Telegram. **Он НЕ торгует.**
 
-# 🚫 ANTI-PATTERNS (STRICTLY PROHIBITED)
-1. ❌ **HFT/Scalping:** No 1m/1s bars. No micro-OFI for sub-minute entries.
-2. ❌ **Auto-Execution:** No `ExecutionEngine`, `OrderManager`, or direct Broker API integration.
-3. ❌ **Silent Failures:** Never use `except Exception: pass`. All errors must be logged and handled.
-4. ❌ **Event Loop Blocks:** CPU-bound math must reside in `ProcessPoolExecutor`.
-5. ❌ **Asset Siloing:** Never analyze a symbol without BTC/ETH Macro Regime context.
+| Параметр | Значение |
+|---|---|
+| Режим | Advisory (оператор-человек принимает решение) |
+| Горизонт | Intraday → swing (минуты до недель), не HFT |
+| Биржа | Bybit USDT-Linear Futures (публичный `publicTrade` WS) |
+| Детекторы | VPIN (Z-score), Sweep, Large Print, OFI Pulse |
+| Тиры чувствительности | `conservative` / `active` (default) / `scanner` |
 
----
+## Жёсткие запреты
 
-# 📋 DEVELOPMENT PROTOCOLS (GEKTOR v2.0)
+1. **Никакого автоисполнения.** Ни `ExecutionEngine`, ни `OrderManager`, ни прямых вызовов trade-REST.
+2. **Никакого HFT.** Не вводить 1m/1s бары, не строить под-минутные стратегии.
+3. **Никаких тихих фейлов.** `try: ... except Exception: pass` — запрещено. Все ошибки логируются с контекстом.
+4. **Не блокировать event loop.** CPU-bound тяжёлая математика — в `ProcessPoolExecutor`. (Текущий VPIN O(1) на бар, в PPE не выносится — это будущая опция для тяжёлых модулей вроде FFD/CUSUM, если они появятся.)
+5. **Не модифицировать `src/domain/vpin_engine.py` без обновления `tests/regression/test_vpin_invariants.py` в том же PR.** Инварианты I1–I5 защищаются автоматически.
 
-## 1. High-Fidelity Macro Ingestion (Phase 1)
-- **Raw Ticks to Buckets:** Transform WebSocket trades into **Adaptive Dollar Bars**.
-- **Conflation:** Batch L2 updates to minimize processing overhead. No noise.
+## Перед каждым PR
 
-## 2. Quant Engine & VPIN (Phase 2)
-- **VPIN:** Calculate volume-synchronized toxicity for medium-term accumulation.
-- **FFD (Fractional Differentiation):** Preserve memory while achieving stationarity.
+1. Прочитать SSOT (если ещё не читал).
+2. Проверить через `grep -rn` / `git ls-files`, что упоминаемые в коде классы/файлы реально существуют. Нет ссылок на TradeSweeper / Aegis / NerveCenter / Stealth CUSUM — этого в коде НЕТ.
+3. Прогнать `.venv/bin/python -m pytest tests/regression tests/test_vpin_engine.py -q`. Должно быть `54+ passed` (v3.6.2 ожидаемо `64+ passed` с liquidity-detectors).
+4. Никаких секретов в коммите. `.env` в `.gitignore`. Bot token живёт только в `.env.production` на VPS.
 
-## 3. Meta-Labeling & Validation (Phase 3)
-- **Purged K-Fold CV:** Eliminate data leakage and autocorrelation.
-- **Embargoing:** A mandatory 1% temporal gap between training and testing sets.
+## Стек (короткой строкой)
 
-## 4. Atomic State Persistence (Phase 4)
-- **Memory Recovery:** All math state (VPIN, CUSUM) must survive container restarts.
-- **Storage:** PostgreSQL/TimescaleDB (Signals) + Redis (Volatile telemetry).
+Python 3.11+ · asyncio · aiohttp · orjson · numpy · SQLAlchemy + aiosqlite (default) / asyncpg (опц.) · loguru · pydantic-settings · pytest+hypothesis.
 
-## 5. Decision Support & Abort Mission (Phase 5)
-- **Invalidation:** Generate `[🚨 ABORT MISSION]` alerts if the microstructural premise breaks before the macro goal is met.
+**Redis в радар-контуре v3.6.x не используется.** Старые упоминания «NerveCenter Redis-Bus» — артефакт документации эпохи v12.0.
 
----
+## Тех-долг и orphan-код
 
-# 🛠️ TECHNOLOGY STACK
-- **Backend:** Python 3.11+ (Strict Typing)
-- **Framework:** `asyncio` + `ProcessPoolExecutor` (Math)
-- **Messaging:** Redis Pub/Sub (NerveCenter)
-- **Monitoring:** Loguru with structured JSON for observability.
+В `src/` ~82 файла, не достижимых из `main.py` (см. AUDIT_REPORT.md §1.3 и Приложение A). Это legacy от Trading-Bot эпохи и аспирационная v12.0 архитектура. Будут удалены отдельным `cleanup(repo)` PR. Не использовать orphan-модули в новых фичах.
 
 ---
 
-# 🚀 OPERATIONS
-- **Start Up:** `python main.py` (Mode: ADVISORY)
-- **Alerts:** Clean, one-way Telegram signal dispatch (Entry/Abort/Heartbeat).
-- **Manifesto Source of Truth:** Read [GEKTOR_MANIFESTO.md](file:///c:/Gerald-superBrain/GEKTOR_MANIFESTO.md) before any architectural change.
+_v3.6.2 — 2026-05-24. Update history: до v3.6.0 этот файл содержал «v2.0 STRICT manifesto» с упоминаниями FFD/PurgedKFold/Embargoing/NerveCenter/ProcessPoolExecutor для VPIN — этих компонентов в коде НИКОГДА не было. Удалено для предотвращения галлюцинаций._
