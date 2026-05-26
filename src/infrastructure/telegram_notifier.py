@@ -75,8 +75,9 @@ class TelegramRadarNotifier:
                 if offset is not None:
                     for i in range(len(s)):
                         ctypes.c_ubyte.from_address(id(s) + offset + i).value = 0
-            except Exception:
-                pass
+            except (ValueError, OSError, ctypes.ArgumentError) as exc:
+                # Best-effort security wipe; failure is non-critical
+                logger.debug(f"[TG] Memory wipe failed (non-critical): {exc!r}")
         self._zero_string = _zero_string
 
         _zero_string(bot_token)

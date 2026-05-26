@@ -430,8 +430,8 @@ class BybitIngestor:
         if self._ws:
             try:
                 await self._ws.close()
-            except Exception:
-                pass
+            except (RuntimeError, ConnectionError) as exc:
+                logger.debug(f"[Ingestor] Socket close error (non-critical): {exc!r}")
             self._ws = None
         self._invalidate_all_l2()
         logger.warning("🔌 [Ingestor] Socket force-killed. L2 state purged.")
@@ -747,8 +747,8 @@ class BybitIngestor:
         if self._ws and not self._ws.closed:
             try:
                 await self._ws.close()
-            except Exception:
-                pass
+            except (RuntimeError, ConnectionError) as exc:
+                logger.debug(f"[Ingestor] Socket close error during stop (non-critical): {exc!r}")
             self._ws = None
 
         # Cancel background tasks

@@ -260,5 +260,5 @@ class EventBus:
             conn.execute("DELETE FROM outbox WHERE status='PROCESSED'")
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             conn.close()
-        except Exception:
-            pass
+        except (sqlite3.Error, OSError) as exc:
+            logger.debug(f"[EventBus] Outbox cleanup on shutdown failed (non-critical): {exc!r}")
