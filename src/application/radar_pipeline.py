@@ -235,9 +235,10 @@ class RadarPipeline:
         self._bar_count += 1
         engine = self._vpin_engines.get(bar.symbol)
         if engine is None:
+            symbol_threshold = self._bar_engine._threshold_for(bar.symbol)
             engine = O1VPINEngine(
                 window_size=self._window_size,
-                volume_threshold=float(self.threshold_usd),
+                volume_threshold=symbol_threshold,
                 z_threshold=self._z_threshold,
                 z_history_size=self._z_history_size,
             )

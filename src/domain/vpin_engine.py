@@ -103,6 +103,7 @@ class O1VPINEngine:
 
         # Pre-allocated buffers — never re-allocated after this point.
         self._imbalances = np.zeros(window_size, dtype=np.float64)
+        self._volumes = np.zeros(window_size, dtype=np.float64)
         self._price_history = np.zeros(window_size, dtype=np.float64)
         self._vpin_history = np.zeros(z_history_size, dtype=np.float64)
 
@@ -113,6 +114,7 @@ class O1VPINEngine:
         self._index = 0
         self._is_filled = False
         self._running_imbalance_sum = 0.0
+        self._running_volume_sum = 0.0
         self._z_index = 0
         self._z_count = 0
         self._vpin_sum = 0.0
@@ -132,8 +134,10 @@ class O1VPINEngine:
         # O(N) but only fires on a time-gap event (rare, hours), not in the
         # hot path.
         self._imbalances *= decay
+        self._volumes *= decay
         self._vpin_history *= decay
         self._running_imbalance_sum = float(self._imbalances.sum())
+        self._running_volume_sum = float(self._volumes.sum())
         self._vpin_sum = float(self._vpin_history.sum())
         self._vpin_sq_sum = float((self._vpin_history**2).sum())
 
@@ -145,6 +149,7 @@ class O1VPINEngine:
         `_rebuild_interval` bars. This is invariant I-noDrift.
         """
         self._running_imbalance_sum = float(self._imbalances.sum())
+        self._running_volume_sum = float(self._volumes.sum())
         self._vpin_sum = float(self._vpin_history.sum())
         self._vpin_sq_sum = float((self._vpin_history**2).sum())
         self._bars_since_rebuild = 0
@@ -183,8 +188,13 @@ class O1VPINEngine:
         # --- VPIN window ring buffer (O(1)) ---
         current_idx = self._index
         old_abs_imbalance = self._imbalances[current_idx]
+        old_volume = self._volumes[current_idx]
+
         self._running_imbalance_sum += (abs_imbalance - old_abs_imbalance)
+        self._running_volume_sum += (bar.volume_usd - old_volume)
+
         self._imbalances[current_idx] = abs_imbalance
+        self._volumes[current_idx] = bar.volume_usd
         self._price_history[current_idx] = price
 
         self._index += 1
@@ -200,7 +210,9 @@ class O1VPINEngine:
             return None
 
         # --- VPIN value ---
-        total_volume = self.volume_threshold * self.window_size
+        total_volume = self._running_volume_sum
+        if total_volume <= 0.0:
+            total_volume = 1.0
         current_vpin = self._running_imbalance_sum / total_volume
         # Clamp to [0, 1] — VPIN is a probability by construction; tiny
         # negative values can arise from float drift.
