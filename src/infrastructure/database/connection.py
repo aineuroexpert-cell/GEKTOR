@@ -31,6 +31,7 @@ class ReliableIngestionBuffer:
             socket_connect_timeout=10,
             health_check_interval=10,
             retry_on_timeout=True,
+            protocol=2,
         )
         self.queue_key = "gektor:ingest:queue"
         self.processing_key = "gektor:ingest:processing"
