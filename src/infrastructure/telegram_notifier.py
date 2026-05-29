@@ -50,13 +50,17 @@ class TelegramRadarNotifier:
         self.proxy_url = proxy_url or settings.TELEGRAM_PROXY or settings.TG_PROXY_URL or settings.PROXY_URL
         self.bus = event_bus
         base_url = (
-            os.getenv("TELEGRAM_API_BASE_URL")
+            getattr(settings, "TELEGRAM_API_BASE_URL", None)
+            or os.getenv("TELEGRAM_API_BASE_URL")
             or os.getenv("TG_API_BASE_URL")
             or "https://api.telegram.org"
         )
         api_url_str = f"{base_url.rstrip('/')}/bot{self.bot_token}/sendMessage"
         
-        logger.info(f"🔑 [Telegram] Token loaded: {bool(self.bot_token)}, Chat ID: {bool(self.chat_id)}, Proxy: {self.proxy_url or 'NONE'}")
+        logger.info(
+            f"🔑 [Telegram] Gateway: {base_url.rstrip('/')}, "
+            f"Token loaded: {bool(self.bot_token)}, Chat ID: {bool(self.chat_id)}, Proxy: {self.proxy_url or 'NONE'}"
+        )
 
         if not api_url_str.startswith("https://"):
             raise ValueError("Insecure protocol: Telegram API must run over HTTPS.")
