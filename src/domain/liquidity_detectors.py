@@ -135,15 +135,6 @@ class SweepDetector:
             is_buyer_maker = True  → taker sold (aggressor=sell)
             is_buyer_maker = False → taker bought (aggressor=buy)
         """
-        # Cooldown: if we just fired, suppress further sweep alerts for
-        # this symbol for `cooldown_sec`. Z-score-like sustained sweeps
-        # would otherwise flood the channel.
-        last_alert = self._last_alert_ts.get(symbol)
-        if last_alert is not None and (ts - last_alert) < self._cooldown_sec:
-            # Still update state so subsequent sweeps see fresh data.
-            self._reset(symbol)
-            return None
-
         direction: Literal["buy", "sell"] = "sell" if is_buyer_maker else "buy"
         notional = price * size
 
@@ -176,22 +167,32 @@ class SweepDetector:
             st.count >= self._min_trades
             and st.notional_usd >= self._min_notional_usd
         ):
+            # Sweep detected! Reset the accumulator.
+            st_copy_notional = st.notional_usd
+            st_copy_count = st.count
+            st_copy_first_ts = st.first_ts
+            self._reset(symbol)
+
+            # Check cooldown before firing.
+            last_alert = self._last_alert_ts.get(symbol)
+            if last_alert is not None and (ts - last_alert) < self._cooldown_sec:
+                return None
+
             alert = LiquidityAlert(
                 symbol=symbol,
                 timestamp=ts,
                 kind="SWEEP",
                 direction=direction,
                 price=price,
-                notional_usd=st.notional_usd,
+                notional_usd=st_copy_notional,
                 extra={
-                    "trade_count": st.count,
-                    "duration_sec": ts - st.first_ts,
+                    "trade_count": st_copy_count,
+                    "duration_sec": ts - st_copy_first_ts,
                     "min_trades": self._min_trades,
                     "min_notional_usd": self._min_notional_usd,
                 },
             )
             self._last_alert_ts[symbol] = ts
-            self._reset(symbol)
             return alert
 
         return None
