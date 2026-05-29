@@ -121,7 +121,12 @@ class BybitWSIngestion:
                                 break
 
                 except Exception as e:
-                    logger.warning(f"[INGESTION] Разрыв сокета: {e}. Реконнект через {backoff}s...")
+                    if "bybit.com" in self.ws_url:
+                        new_url = self.ws_url.replace("bybit.com", "bytick.com")
+                        logger.warning(f"[INGESTION] Разрыв сокета или сбой подключения ({e}). Переключаем URL с {self.ws_url} на {new_url}...")
+                        self.ws_url = new_url
+                    else:
+                        logger.warning(f"[INGESTION] Разрыв сокета: {e}. Реконнект через {backoff}s...")
                 finally:
                     if ping_task is not None:
                         ping_task.cancel()

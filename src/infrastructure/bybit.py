@@ -317,19 +317,41 @@ class BybitRestClient:
                 
                 return lst
         except Exception as e:
-            logger.error(f"❌ [Bybit] Tickers API error: {e}")
-            return 0.0 if symbol else []
+            if "bybit.com" in self.base_url:
+                logger.warning(f"⚠️ [Bybit] Connection to {self.base_url} failed: {e}. Switching base URL to api.bytick.com...")
+                self.base_url = "https://api.bytick.com"
+                try:
+                    session = await self._get_session()
+                    url = f"{self.base_url}/v5/market/tickers?category=linear"
+                    if symbol:
+                        url += f"&symbol={symbol}"
+                    async with session.get(url, timeout=10) as resp:
+                        raw = await resp.read()
+                        resp_data = orjson.loads(raw)
+                        lst = resp_data.get("result", {}).get("list", [])
+                        if symbol:
+                            if not lst:
+                                return 0.0
+                            return float(lst[0].get("lastPrice", 0.0))
+                        return lst
+                except Exception as ex:
+                    logger.error(f"❌ [Bybit] Tickers API error after fallback: {ex}")
+                    return 0.0 if symbol else []
+            else:
+                logger.error(f"❌ [Bybit] Tickers API error: {e}")
+                return 0.0 if symbol else []
 
     async def fetch_active_symbols(self) -> List[str]:
         """[GEKTOR v5.50] Discovery Protocol."""
         try:
             tickers = await self.get_tickers()
-            if isinstance(tickers, list):
+            if isinstance(tickers, list) and len(tickers) > 0:
                 symbols = [t["symbol"] for t in tickers if t["symbol"].endswith("USDT")]
-            else:
-                symbols = []
-            logger.success(f"📡 [Bybit] Found {len(symbols)} active USDT-Linear contracts.")
-            return symbols
+                if symbols:
+                    logger.success(f"📡 [Bybit] Found {len(symbols)} active USDT-Linear contracts.")
+                    return symbols
+            logger.warning("📡 [Bybit] Discovery tickers empty. Falling back to default liquid contracts.")
+            return ["BTCUSDT", "ETHUSDT"]
         except Exception as e:
             logger.error(f"❌ [Bybit] Discovery Error: {e}")
             return ["BTCUSDT", "ETHUSDT"]
