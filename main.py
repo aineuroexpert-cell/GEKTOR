@@ -402,10 +402,16 @@ def main() -> NoReturn:
 
     try:
         loop.run_until_complete(core.startup())
+    except KeyboardInterrupt:
+        logger.warning("[SYSTEM] KeyboardInterrupt перехвачен. Вызов Graceful Shutdown...")
+        loop.run_until_complete(core.shutdown(signal.SIGINT))
     except asyncio.CancelledError:
         pass
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
         sys.exit(0)
 
 if __name__ == "__main__":
