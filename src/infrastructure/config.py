@@ -30,6 +30,14 @@ class Settings(BaseSettings):
             "tg_chat_id",
         ),
     )
+    TELEGRAM_API_BASE_URL: str = Field(
+        default="https://api.telegram.org",
+        validation_alias=AliasChoices(
+            "telegram_api_base_url",
+            "tg_api_base_url",
+            "telegram_api_url",
+        ),
+    )
 
     # Infrastructure
     REDIS_HOST: str = Field(default="localhost", alias="redis_host")

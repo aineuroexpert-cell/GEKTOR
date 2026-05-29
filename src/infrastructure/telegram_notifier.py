@@ -49,7 +49,12 @@ class TelegramRadarNotifier:
         self.chat_id = chat_id
         self.proxy_url = proxy_url or settings.TELEGRAM_PROXY or settings.TG_PROXY_URL or settings.PROXY_URL
         self.bus = event_bus
-        api_url_str = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        base_url = (
+            os.getenv("TELEGRAM_API_BASE_URL")
+            or os.getenv("TG_API_BASE_URL")
+            or "https://api.telegram.org"
+        )
+        api_url_str = f"{base_url.rstrip('/')}/bot{self.bot_token}/sendMessage"
         
         logger.info(f"🔑 [Telegram] Token loaded: {bool(self.bot_token)}, Chat ID: {bool(self.chat_id)}, Proxy: {self.proxy_url or 'NONE'}")
 
