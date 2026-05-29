@@ -191,13 +191,14 @@ class RadarPipeline:
                 size=size,
                 ts=exchange_ts,
             )
-            for alert in liquidity_alerts:
-                # Rate-limit liquidity alerts under the same per-symbol cooldown
-                # as VPIN alerts — prevents flooding when both fire on the same
-                # event. Use a derived key so Sweep and OFI Pulse don't shadow VPIN.
-                if not self._rate_limiter.allow(f"{alert.kind}:{alert.symbol}"):
-                    continue
-                await self._dispatch_liquidity_alert(alert)
+            if liquidity_alerts is not None:
+                for alert in liquidity_alerts:
+                    # Rate-limit liquidity alerts under the same per-symbol cooldown
+                    # as VPIN alerts — prevents flooding when both fire on the same
+                    # event. Use a derived key so Sweep and OFI Pulse don't shadow VPIN.
+                    if not self._rate_limiter.allow(f"{alert.kind}:{alert.symbol}"):
+                        continue
+                    await self._dispatch_liquidity_alert(alert)
 
         await self._bar_engine.process_tick(
             symbol=symbol,

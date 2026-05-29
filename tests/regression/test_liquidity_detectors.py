@@ -231,7 +231,7 @@ def test_bank_disabled_when_all_none() -> None:
     bank = LiquidityDetectorBank(sweep=None, large_print=None, ofi_pulse=None)
     assert not bank.enabled
     out = bank.process_tick("BTCUSDT", False, 100.0, 1.0, 0.0)
-    assert out == []
+    assert out is None
 
 
 def test_bank_collects_alerts_from_all_detectors() -> None:
@@ -245,7 +245,7 @@ def test_bank_collects_alerts_from_all_detectors() -> None:
     assert bank.enabled
     # First tick: small, no sweep yet, no large print.
     out1 = bank.process_tick("BTCUSDT", False, 1.0, 100.0, 0.0)
-    assert out1 == []
+    assert out1 is None
     # Second tick: huge size → triggers both sweep (2 trades, $100k total)
     # AND large print (0.1% of $10M turnover = $10k threshold; trade is $100k).
     out2 = bank.process_tick("BTCUSDT", False, 1.0, 100_000.0, 1.0)

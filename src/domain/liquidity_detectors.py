@@ -39,6 +39,7 @@ Forbidden in this file (mirrors vpin_engine.py):
 """
 from __future__ import annotations
 
+import bisect
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -326,6 +327,7 @@ class OFIPulseDetector:
         "_min_history",
         "_cooldown_sec",
         "_buckets",
+        "_sorted_abs",
         "_last_alert_ts",
     )
 
@@ -354,6 +356,7 @@ class OFIPulseDetector:
         self._min_history = min_history
         self._cooldown_sec = cooldown_sec
         self._buckets: dict[str, deque[_OFIBucket]] = {}
+        self._sorted_abs: dict[str, list[float]] = {}
         self._last_alert_ts: dict[str, float] = {}
 
     def process_tick(  # noqa: PLR0911 — early-return ladder is clearer than nested ifs
@@ -370,6 +373,7 @@ class OFIPulseDetector:
         if bq is None:
             bq = deque(maxlen=self._history_buckets)
             self._buckets[symbol] = bq
+            self._sorted_abs[symbol] = []
 
         # Snap ts to the bucket boundary.
         bucket_start = ts - (ts % self._bucket_sec)
@@ -378,6 +382,41 @@ class OFIPulseDetector:
         if bq and bq[-1].bucket_start_ts == bucket_start:
             cur = bq[-1]
         else:
+            # We are opening a new bucket! The previous bq[-1] is now closed.
+            if bq:
+                prev_bucket = bq[-1]
+                prev_abs = abs(prev_bucket.buy_usd - prev_bucket.sell_usd)
+
+                # If bq was at maxlen, the next append will pop the oldest bq[0]
+                if len(bq) == self._history_buckets:
+                    oldest_bucket = bq[0]
+                    oldest_abs = abs(oldest_bucket.buy_usd - oldest_bucket.sell_usd)
+                    try:
+                        self._sorted_abs[symbol].remove(oldest_abs)
+                    except ValueError:
+                        pass
+
+                bisect.insort(self._sorted_abs[symbol], prev_abs)
+
+                # Handle P7 time gap injection (inject empty buckets if gap)
+                last_start = prev_bucket.bucket_start_ts
+                gap_sec = bucket_start - last_start
+                if gap_sec > self._bucket_sec:
+                    num_empty = int(gap_sec // self._bucket_sec) - 1
+                    num_empty = min(num_empty, self._history_buckets)
+                    for i in range(1, num_empty + 1):
+                        empty_start = last_start + i * self._bucket_sec
+                        if len(bq) == self._history_buckets:
+                            oldest_bucket = bq[0]
+                            oldest_abs = abs(oldest_bucket.buy_usd - oldest_bucket.sell_usd)
+                            try:
+                                self._sorted_abs[symbol].remove(oldest_abs)
+                            except ValueError:
+                                pass
+                        
+                        bq.append(_OFIBucket(bucket_start_ts=empty_start, buy_usd=0.0, sell_usd=0.0))
+                        bisect.insort(self._sorted_abs[symbol], 0.0)
+
             cur = _OFIBucket(bucket_start_ts=bucket_start, buy_usd=0.0, sell_usd=0.0)
             bq.append(cur)
 
@@ -387,7 +426,9 @@ class OFIPulseDetector:
             cur.buy_usd += notional
 
         # Need enough history for a meaningful median.
-        if len(bq) < self._min_history + 1:
+        prior_abs = self._sorted_abs[symbol]
+        n = len(prior_abs)
+        if n < self._min_history:
             return None
 
         # Compute current bucket's signed OFI and absolute magnitude.
@@ -396,14 +437,7 @@ class OFIPulseDetector:
         if cur_abs < self._min_notional_usd:
             return None
 
-        # Median absolute OFI over the prior buckets (exclude current).
-        prior_abs = [
-            abs(b.buy_usd - b.sell_usd) for b in bq if b is not cur
-        ]
-        if not prior_abs:
-            return None
-        prior_abs.sort()
-        n = len(prior_abs)
+        # Median absolute OFI over the prior buckets (O(1) from sorted array).
         if n % 2 == 1:
             median_abs = prior_abs[n // 2]
         else:
@@ -482,21 +516,23 @@ class LiquidityDetectorBank:
         price: float,
         size: float,
         ts: float,
-    ) -> list[LiquidityAlert]:
+    ) -> list[LiquidityAlert] | None:
         if not self._enabled:
-            return []
+            return None
+
+        a_sweep = self.sweep.process_tick(symbol, is_buyer_maker, price, size, ts) if self.sweep is not None else None
+        a_lp = self.large_print.process_tick(symbol, is_buyer_maker, price, size, ts) if self.large_print is not None else None
+        a_ofi = self.ofi_pulse.process_tick(symbol, is_buyer_maker, price, size, ts) if self.ofi_pulse is not None else None
+
+        if a_sweep is None and a_lp is None and a_ofi is None:
+            return None
+
         out: list[LiquidityAlert] = []
-        if self.sweep is not None:
-            a = self.sweep.process_tick(symbol, is_buyer_maker, price, size, ts)
-            if a is not None:
-                out.append(a)
-        if self.large_print is not None:
-            a = self.large_print.process_tick(symbol, is_buyer_maker, price, size, ts)
-            if a is not None:
-                out.append(a)
-        if self.ofi_pulse is not None:
-            a = self.ofi_pulse.process_tick(symbol, is_buyer_maker, price, size, ts)
-            if a is not None:
-                out.append(a)
+        if a_sweep is not None:
+            out.append(a_sweep)
+        if a_lp is not None:
+            out.append(a_lp)
+        if a_ofi is not None:
+            out.append(a_ofi)
         return out
 
