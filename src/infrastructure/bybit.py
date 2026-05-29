@@ -12,7 +12,6 @@ from src.application.microstructure import MicrostructureAnalyzer, OrderBookSequ
 from src.domain.exit_protocol import MarketTick
 from aiohttp_socks import ProxyConnector
 from .config import settings
-from .monitoring import FastEMAClockSynchronizer, HardwareClockSynchronizer
 from src.shared.resilience import GlobalResilienceManager
 
 def safe_float(val: Any) -> float:
@@ -396,7 +395,6 @@ class BybitIngestor:
         self._analyzers: Dict[str, MicrostructureAnalyzer] = {}
         self._discriminators: Dict[str, SpoofingDiscriminator] = {}
         self._sequence_guards: Dict[str, OrderBookSequenceGuard] = {}
-        self.lag_monitor = FastEMAClockSynchronizer(alpha=0.01, max_allowed_lag_ms=300.0)
         self._last_symbol_tick: dict[str, float] = {s: time.monotonic() for s in symbols}
         
         self._ingest_queue: asyncio.Queue = asyncio.Queue(maxsize=75_000)
