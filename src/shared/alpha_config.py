@@ -68,7 +68,7 @@ class AlphaConfig:
         # VPIN Engine
         self.VPIN_WINDOW_SIZE = int(data.get("vpin_window_size", os.getenv("VPIN_WINDOW", 50)))
         self.VPIN_ANOMALY_Z = float(data.get("vpin_anomaly_z", os.getenv("VPIN_Z", 0)))
-        self.VPIN_TIME_GAP_SEC = int(data.get("vpin_time_gap_sec", os.getenv("VPIN_GAP", 900)))
+        self.VPIN_TIME_GAP_SEC = int(data.get("vpin_time_gap_sec", os.getenv("VPIN_GAP", 14400)))
         self.VPIN_DECAY_TAU_HOURS = int(data.get("vpin_decay_tau_hours", os.getenv("VPIN_TAU", 4)))
         self.VPIN_BUCKET_SIGNIFICANCE_PCT = float(data.get("vpin_bucket_significance_pct", os.getenv("VPIN_SIG", 0.8)))
 

@@ -168,10 +168,17 @@ class O1VPINEngine:
         if time_delta > alpha.VPIN_TIME_GAP_SEC:
             decay = math.exp(-time_delta / (3600.0 * max(alpha.VPIN_DECAY_TAU_HOURS, 1)))
             self._apply_time_decay(decay)
-            logger.warning(
-                f"[VPIN] Time gap detected ({time_delta / 60:.1f}m). "
-                f"Stats decayed by {100 * (1 - decay):.1f}%."
-            )
+            # Issue WARNING only for extreme gaps (e.g. > 4h), use DEBUG for expected slow trading intervals
+            if time_delta > 14400.0:
+                logger.warning(
+                    f"[VPIN] Extreme time gap detected ({time_delta / 3600:.1f}h). "
+                    f"Stats decayed by {100 * (1 - decay):.1f}%."
+                )
+            else:
+                logger.debug(
+                    f"[VPIN] Time gap detected ({time_delta / 60:.1f}m). "
+                    f"Stats decayed by {100 * (1 - decay):.1f}%."
+                )
 
         # --- VPIN window ring buffer (O(1)) ---
         current_idx = self._index
