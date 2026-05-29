@@ -65,10 +65,12 @@ class O1VPINEngine:
         "_anomaly_threshold_z",
         # VPIN window state
         "_imbalances",
+        "_volumes",
         "_price_history",
         "_index",
         "_is_filled",
         "_running_imbalance_sum",
+        "_running_volume_sum",
         # Z-Score independent buffer
         "_vpin_history",
         "_z_index",
