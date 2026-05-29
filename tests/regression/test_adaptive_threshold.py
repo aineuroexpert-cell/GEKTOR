@@ -8,8 +8,6 @@ Pins down:
 """
 from __future__ import annotations
 
-from decimal import Decimal
-
 import pytest
 
 from src.infrastructure.adaptive_threshold import (
@@ -74,13 +72,13 @@ async def test_threshold_clamping() -> None:
     )
     n = await p.refresh()
     assert n == 4  # BTC, ETH, NIL, GARBAGE — USDC excluded
-    assert p.threshold_for("BTCUSDT") == Decimal("5000000")
-    assert p.threshold_for("ETHUSDT") == Decimal("100000")
-    assert p.threshold_for("NILUSDT") == Decimal("20000")
+    assert p.threshold_for("BTCUSDT") == 5000000.0
+    assert p.threshold_for("ETHUSDT") == 100000.0
+    assert p.threshold_for("NILUSDT") == 20000.0
     # GARBAGEUSDT: turnover=0 in cache → _compute_threshold(0) returns default.
-    assert p.threshold_for("GARBAGEUSDT") == Decimal("1000000")
+    assert p.threshold_for("GARBAGEUSDT") == 1000000.0
     # Unknown symbol: falls back to default.
-    assert p.threshold_for("UNKNOWN") == Decimal("1000000")
+    assert p.threshold_for("UNKNOWN") == 1000000.0
 
 
 @pytest.mark.asyncio
@@ -132,4 +130,4 @@ def test_threshold_for_before_first_refresh_returns_default() -> None:
         rest_client=rest,
         default_usd=500_000.0,
     )
-    assert p.threshold_for("BTCUSDT") == Decimal("500000.0")
+    assert p.threshold_for("BTCUSDT") == 500000.0

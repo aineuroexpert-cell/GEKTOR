@@ -10,8 +10,6 @@ in-process mock alert sink. They protect against:
 """
 from __future__ import annotations
 
-from decimal import Decimal
-
 import pytest
 
 from src.application.radar_pipeline import RadarAlert, RadarPipeline
@@ -29,7 +27,7 @@ class _MockSink:
 async def test_pipeline_emits_alert_on_sustained_buy_imbalance() -> None:
     sink = _MockSink()
     pipe = RadarPipeline(
-        threshold_usd=Decimal("1000"),
+        threshold_usd=1000.0,
         alert_sink=sink,
         window_size=4,
         z_threshold=2.0,
@@ -40,15 +38,15 @@ async def test_pipeline_emits_alert_on_sustained_buy_imbalance() -> None:
     # Warmup: balanced bars so Z-Score history accumulates without anomalies.
     for i in range(20):
         for _ in range(10):  # 10 ticks of $100 -> $1000 bar threshold
-            await pipe.on_trade("BTCUSDT", "Buy", Decimal("100"), Decimal("1"), float(i))
-            await pipe.on_trade("BTCUSDT", "Sell", Decimal("100"), Decimal("1"), float(i))
+            await pipe.on_trade("BTCUSDT", "Buy", 100.0, 1.0, float(i))
+            await pipe.on_trade("BTCUSDT", "Sell", 100.0, 1.0, float(i))
 
     pre_alert_count = len(sink.alerts)
 
     # Inject a sharply buy-skewed burst — should trigger anomaly.
     for j in range(5):
         for _ in range(10):
-            await pipe.on_trade("BTCUSDT", "Buy", Decimal("100"), Decimal("1"), 100.0 + j)
+            await pipe.on_trade("BTCUSDT", "Buy", 100.0, 1.0, 100.0 + j)
 
     assert len(sink.alerts) > pre_alert_count, (
         "Pipeline failed to emit an alert on a strong buy imbalance burst"
@@ -66,7 +64,7 @@ async def test_pipeline_polarity_taker_sell_increments_sell_volume() -> None:
     """
     sink = _MockSink()
     pipe = RadarPipeline(
-        threshold_usd=Decimal("1000"),
+        threshold_usd=1000.0,
         alert_sink=sink,
         window_size=2,
         z_threshold=10.0,  # we don't care about alerts here
@@ -84,7 +82,7 @@ async def test_pipeline_polarity_taker_sell_increments_sell_volume() -> None:
     pipe._bar_engine.set_callback(spy)  # type: ignore[arg-type]
 
     for _ in range(10):
-        await pipe.on_trade("ETHUSDT", "Sell", Decimal("100"), Decimal("1"), 1.0)
+        await pipe.on_trade("ETHUSDT", "Sell", 100.0, 1.0, 1.0)
 
     assert len(captured) >= 1
     bar = captured[0]
@@ -96,7 +94,7 @@ async def test_pipeline_polarity_taker_sell_increments_sell_volume() -> None:
 async def test_pipeline_rate_limit_suppresses_duplicate_alerts() -> None:
     sink = _MockSink()
     pipe = RadarPipeline(
-        threshold_usd=Decimal("1000"),
+        threshold_usd=1000.0,
         alert_sink=sink,
         window_size=4,
         z_threshold=1.0,
@@ -107,13 +105,13 @@ async def test_pipeline_rate_limit_suppresses_duplicate_alerts() -> None:
     # Long balanced warmup.
     for i in range(20):
         for _ in range(10):
-            await pipe.on_trade("BTCUSDT", "Buy", Decimal("100"), Decimal("1"), float(i))
-            await pipe.on_trade("BTCUSDT", "Sell", Decimal("100"), Decimal("1"), float(i))
+            await pipe.on_trade("BTCUSDT", "Buy", 100.0, 1.0, float(i))
+            await pipe.on_trade("BTCUSDT", "Sell", 100.0, 1.0, float(i))
 
     # Now keep slamming buy-side to create many anomalies.
     for j in range(30):
         for _ in range(10):
-            await pipe.on_trade("BTCUSDT", "Buy", Decimal("100"), Decimal("1"), 100.0 + j)
+            await pipe.on_trade("BTCUSDT", "Buy", 100.0, 1.0, 100.0 + j)
 
     # Should have produced AT MOST 1 alert thanks to the rate limiter.
     assert len(sink.alerts) <= 1, (
@@ -125,7 +123,7 @@ async def test_pipeline_rate_limit_suppresses_duplicate_alerts() -> None:
 async def test_pipeline_per_symbol_isolation() -> None:
     sink = _MockSink()
     pipe = RadarPipeline(
-        threshold_usd=Decimal("1000"),
+        threshold_usd=1000.0,
         alert_sink=sink,
         window_size=4,
         z_threshold=10.0,
@@ -133,7 +131,7 @@ async def test_pipeline_per_symbol_isolation() -> None:
 
     # Feed only BTCUSDT.
     for _ in range(10):
-        await pipe.on_trade("BTCUSDT", "Buy", Decimal("100"), Decimal("1"), 1.0)
+        await pipe.on_trade("BTCUSDT", "Buy", 100.0, 1.0, 1.0)
 
     metrics = pipe.metrics()
     # Bar may have closed exactly at the threshold; symbol must be present
@@ -142,7 +140,7 @@ async def test_pipeline_per_symbol_isolation() -> None:
 
     # Now feed ETHUSDT independently.
     for _ in range(10):
-        await pipe.on_trade("ETHUSDT", "Sell", Decimal("200"), Decimal("1"), 2.0)
+        await pipe.on_trade("ETHUSDT", "Sell", 200.0, 1.0, 2.0)
 
     metrics = pipe.metrics()
     # Both symbols should now have spawned VPIN engines (each closed at least one bar).
@@ -164,7 +162,7 @@ async def test_pipeline_alert_failure_does_not_break_processing() -> None:
 
     sink = FailingSink()
     pipe = RadarPipeline(
-        threshold_usd=Decimal("1000"),
+        threshold_usd=1000.0,
         alert_sink=sink,  # type: ignore[arg-type]
         window_size=4,
         z_threshold=0.5,
@@ -175,13 +173,13 @@ async def test_pipeline_alert_failure_does_not_break_processing() -> None:
     # warmup
     for i in range(10):
         for _ in range(10):
-            await pipe.on_trade("BTCUSDT", "Buy", Decimal("100"), Decimal("1"), float(i))
-            await pipe.on_trade("BTCUSDT", "Sell", Decimal("100"), Decimal("1"), float(i))
+            await pipe.on_trade("BTCUSDT", "Buy", 100.0, 1.0, float(i))
+            await pipe.on_trade("BTCUSDT", "Sell", 100.0, 1.0, float(i))
 
     # burst
     for j in range(5):
         for _ in range(10):
-            await pipe.on_trade("BTCUSDT", "Buy", Decimal("100"), Decimal("1"), 100.0 + j)
+            await pipe.on_trade("BTCUSDT", "Buy", 100.0, 1.0, 100.0 + j)
 
     # Pipeline must not have crashed; tick count keeps increasing.
     assert pipe.metrics()["tick_count"] == 200 + 50

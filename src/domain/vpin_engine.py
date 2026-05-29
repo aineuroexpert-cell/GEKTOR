@@ -154,9 +154,9 @@ class O1VPINEngine:
 
         Hot path: no imports here, no allocations, O(1) per bar.
         """
-        buy_vol = float(bar.buy_volume_usd)
-        sell_vol = float(bar.sell_volume_usd)
-        price = float(bar.close)
+        buy_vol = bar.buy_volume_usd
+        sell_vol = bar.sell_volume_usd
+        price = bar.close
 
         imbalance = buy_vol - sell_vol
         abs_imbalance = abs(imbalance)

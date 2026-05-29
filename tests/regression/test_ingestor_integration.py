@@ -14,8 +14,6 @@ This catches regressions in:
 """
 from __future__ import annotations
 
-from decimal import Decimal
-
 import orjson
 import pytest
 
@@ -64,7 +62,7 @@ async def test_full_ingestor_to_alert_pipeline() -> None:
     """
     sink = _RecordingSink()
     pipe = RadarPipeline(
-        threshold_usd=Decimal("1000"),
+        threshold_usd=1000.0,
         alert_sink=sink,
         window_size=4,
         z_threshold=2.0,
@@ -108,7 +106,8 @@ async def test_ingestor_polarity_aggressor_buy_maps_to_buy_volume() -> None:
             pass
 
     pipe = RadarPipeline(
-        threshold_usd=Decimal("1000"),
+    pipe = RadarPipeline(
+        threshold_usd=1000.0,
         alert_sink=CaptureSink(),
         window_size=2,
         z_threshold=10.0,
@@ -139,7 +138,8 @@ async def test_ingestor_polarity_aggressor_buy_maps_to_buy_volume() -> None:
 async def test_ingestor_ignores_non_trade_topics() -> None:
     sink = _RecordingSink()
     pipe = RadarPipeline(
-        threshold_usd=Decimal("1000"),
+    pipe = RadarPipeline(
+        threshold_usd=1000.0,
         alert_sink=sink,
         window_size=2,
         z_threshold=10.0,
@@ -156,7 +156,8 @@ async def test_ingestor_ignores_non_trade_topics() -> None:
 async def test_ingestor_survives_malformed_payload() -> None:
     sink = _RecordingSink()
     pipe = RadarPipeline(
-        threshold_usd=Decimal("1000"),
+    pipe = RadarPipeline(
+        threshold_usd=1000.0,
         alert_sink=sink,
         window_size=2,
         z_threshold=10.0,

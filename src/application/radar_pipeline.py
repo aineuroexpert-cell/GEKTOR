@@ -30,7 +30,6 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from decimal import Decimal
 
 from loguru import logger
 
@@ -58,7 +57,7 @@ class RadarAlert:
 # notifier. Kept simple so it can be a closure over a Telegram client.
 AlertSink = Callable[[RadarAlert], Awaitable[None]]
 LiquidityAlertSink = Callable[[LiquidityAlert], Awaitable[None]]
-ThresholdProvider = Callable[[str], Decimal]
+ThresholdProvider = Callable[[str], float]
 
 
 class _SymbolPerSymbolRateLimiter:
@@ -95,7 +94,7 @@ class RadarPipeline:
 
     def __init__(
         self,
-        threshold_usd: Decimal,
+        threshold_usd: float,
         alert_sink: AlertSink,
         window_size: int = 50,
         z_threshold: float = 2.5,
@@ -147,8 +146,8 @@ class RadarPipeline:
         self,
         symbol: str,
         side: str,
-        price: Decimal,
-        size: Decimal,
+        price: float,
+        size: float,
         exchange_ts: float,
     ) -> None:
         """Ingest a single trade tick from the WS feed.
@@ -169,8 +168,8 @@ class RadarPipeline:
     async def process_tick(
         self,
         symbol: str,
-        price: Decimal,
-        size: Decimal,
+        price: float,
+        size: float,
         is_buyer_maker: bool,
         exchange_ts: float,
     ) -> None:
@@ -188,8 +187,8 @@ class RadarPipeline:
             liquidity_alerts = self._liquidity_detectors.process_tick(
                 symbol=symbol,
                 is_buyer_maker=is_buyer_maker,
-                price=float(price),
-                size=float(size),
+                price=price,
+                size=size,
                 ts=exchange_ts,
             )
             for alert in liquidity_alerts:
@@ -269,8 +268,8 @@ class RadarPipeline:
         alert = RadarAlert(
             symbol=bar.symbol,
             timestamp=bar.end_ts,
-            bar_open=float(bar.open),
-            bar_close=float(bar.close),
+            bar_open=bar.open,
+            bar_close=bar.close,
             vpin=signal.vpin_value,
             z_score=signal.z_score,
             direction=signal.direction,

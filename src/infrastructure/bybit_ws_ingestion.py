@@ -2,13 +2,12 @@ import asyncio
 import logging
 import aiohttp
 import orjson
-from decimal import Decimal
 from typing import Protocol
 
 logger = logging.getLogger("GEKTOR_INGESTION")
 
 class IBarAggregator(Protocol):
-    async def process_tick(self, symbol: str, price: Decimal, size: Decimal, is_buyer_maker: bool, exchange_ts: float) -> None: ...
+    async def process_tick(self, symbol: str, price: float, size: float, is_buyer_maker: bool, exchange_ts: float) -> None: ...
     async def handle_resync(self) -> None: ... # [Внедрено для защиты от разрыва каузальности]
 
 class BybitWSIngestion:
@@ -51,8 +50,8 @@ class BybitWSIngestion:
             symbol = data.get("topic").split(".")[-1]
             
             for trade in data["data"]:
-                price = Decimal(trade["p"])
-                size = Decimal(trade["v"])
+                price = float(trade["p"])
+                size = float(trade["v"])
                 is_buyer_maker = trade["S"] == "Sell" # Если агрессор Sell, maker был Buyer
                 exchange_ts = float(trade["T"]) / 1000.0
 

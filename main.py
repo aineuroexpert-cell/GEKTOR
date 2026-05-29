@@ -4,7 +4,6 @@ import os
 import signal
 import sys
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import NoReturn
 
 from src.application.outbox_alert_sink import OutboxAlertSink
@@ -157,7 +156,7 @@ class GektorRadarCore:
 
         self.alert_sink = OutboxAlertSink(self.db)
         self.radar = RadarPipeline(
-            threshold_usd=Decimal(str(threshold_usd_env)),
+            threshold_usd=threshold_usd_env,
             alert_sink=self.alert_sink,
             window_size=vpin_window,
             z_threshold=z_threshold,

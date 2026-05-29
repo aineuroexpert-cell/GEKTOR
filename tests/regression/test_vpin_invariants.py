@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import ast
 import math
-from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
@@ -27,17 +26,17 @@ from src.domain.vpin_engine import O1VPINEngine
 
 
 def _bar(buy: float, sell: float, close: float = 100.0, symbol: str = "BTCUSDT") -> DollarBar:
-    """Build a DollarBar with Decimal volumes (matches conflation.py)."""
+    """Build a DollarBar with float volumes (matches conflation.py v3.6.3)."""
     return DollarBar(
         symbol=symbol,
-        open=Decimal(str(close)),
-        high=Decimal(str(close)),
-        low=Decimal(str(close)),
-        close=Decimal(str(close)),
-        buy_volume_usd=Decimal(str(buy)),
-        sell_volume_usd=Decimal(str(sell)),
-        volume_usd=Decimal(str(buy + sell)),
-        volume_crypto=Decimal("0"),
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        buy_volume_usd=buy,
+        sell_volume_usd=sell,
+        volume_usd=buy + sell,
+        volume_crypto=0.0,
     )
 
 
@@ -287,7 +286,7 @@ def test_I5_polarity_taker_sell_increments_sell_volume() -> None:
 
     from src.domain.conflation import DollarBarEngine
 
-    eng = DollarBarEngine(threshold_usd=Decimal("1000"))
+    eng = DollarBarEngine(threshold_usd=1000.0)
 
     closed_bars: list[DollarBar] = []
 
@@ -300,8 +299,8 @@ def test_I5_polarity_taker_sell_increments_sell_volume() -> None:
         # Taker SELL (maker was buyer).
         await eng.process_tick(
             symbol="BTCUSDT",
-            price=Decimal("100"),
-            size=Decimal("12"),
+            price=100.0,
+            size=12.0,
             is_buyer_maker=True,
             exchange_ts=1.0,
         )
@@ -309,5 +308,5 @@ def test_I5_polarity_taker_sell_increments_sell_volume() -> None:
     asyncio.run(feed())
     assert len(closed_bars) == 1
     bar = closed_bars[0]
-    assert bar.sell_volume_usd == Decimal("1200")
-    assert bar.buy_volume_usd == Decimal("0")
+    assert bar.sell_volume_usd == 1200.0
+    assert bar.buy_volume_usd == 0.0

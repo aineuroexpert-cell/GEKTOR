@@ -52,7 +52,6 @@ regardless of universe size.
 from __future__ import annotations
 
 import asyncio
-from decimal import Decimal
 from typing import Any, Protocol
 
 from loguru import logger
@@ -149,7 +148,7 @@ class AdaptiveDollarThresholdProvider:
         self._max_usd = max_usd
         self._default_usd = default_usd
         self._turnover_cache: dict[str, float] = {}
-        self._threshold_cache: dict[str, Decimal] = {}
+        self._threshold_cache: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self._refresh_count = 0
 
@@ -157,12 +156,12 @@ class AdaptiveDollarThresholdProvider:
     # Sync hot-path accessors
     # ------------------------------------------------------------------
 
-    def threshold_for(self, symbol: str) -> Decimal:
+    def threshold_for(self, symbol: str) -> float:
         cached = self._threshold_cache.get(symbol)
         if cached is not None:
             return cached
         # Fallback before first refresh or for unknown symbols.
-        return Decimal(str(self._default_usd))
+        return self._default_usd
 
     def turnover_for(self, symbol: str) -> float:
         return self._turnover_cache.get(symbol, 0.0)
@@ -205,7 +204,7 @@ class AdaptiveDollarThresholdProvider:
                 return 0
 
             new_turnover: dict[str, float] = {}
-            new_threshold: dict[str, Decimal] = {}
+            new_threshold: dict[str, float] = {}
             for entry in raw_tickers:
                 sym = entry.get("symbol")
                 if not sym or not isinstance(sym, str):
@@ -227,12 +226,12 @@ class AdaptiveDollarThresholdProvider:
             )
             return len(new_threshold)
 
-    def _compute_threshold(self, turnover_24h: float) -> Decimal:
+    def _compute_threshold(self, turnover_24h: float) -> float:
         if turnover_24h <= 0.0:
-            return Decimal(str(self._default_usd))
+            return self._default_usd
         raw = turnover_24h / float(self._target_bars_per_day)
         clamped = max(self._min_usd, min(self._max_usd, raw))
-        return Decimal(str(round(clamped, 2)))
+        return round(clamped, 2)
 
 
 # ----------------------------------------------------------------------

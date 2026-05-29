@@ -2,7 +2,6 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import Protocol
 
 logger = logging.getLogger("GEKTOR_CONFLATION")
@@ -10,16 +9,16 @@ logger = logging.getLogger("GEKTOR_CONFLATION")
 @dataclass(slots=True)
 class DollarBar:
     symbol: str
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
+    open: float
+    high: float
+    low: float
+    close: float
 
     # Микроструктурные метрики
-    volume_crypto: Decimal = Decimal('0')
-    volume_usd: Decimal = Decimal('0')
-    buy_volume_usd: Decimal = Decimal('0')
-    sell_volume_usd: Decimal = Decimal('0')
+    volume_crypto: float = 0.0
+    volume_usd: float = 0.0
+    buy_volume_usd: float = 0.0
+    sell_volume_usd: float = 0.0
     tick_count: int = 0
 
     # Временные метки биржи (Exchange Time)
@@ -29,10 +28,10 @@ class DollarBar:
     # Optional OFI accumulator used by RealtimeDollarBarGenerator (dollar_bar.py).
     # Not used by DollarBarEngine / RadarPipeline. Kept on the dataclass so that
     # slots=True does not break the alternative generator.
-    ofi_accum: Decimal = Decimal("0")
+    ofi_accum: float = 0.0
 
     @property
-    def order_flow_imbalance(self) -> Decimal:
+    def order_flow_imbalance(self) -> float:
         """
         Дельта стакана внутри бара. 
         Положительное значение = доминация рыночных покупателей (Taker Buy).
@@ -44,8 +43,8 @@ class IBarAggregator(Protocol):
     async def process_tick(
         self,
         symbol: str,
-        price: Decimal,
-        size: Decimal,
+        price: float,
+        size: float,
         is_buyer_maker: bool,
         exchange_ts: float,
     ) -> None:
@@ -70,11 +69,14 @@ class DollarBarEngine(IBarAggregator):
     `threshold_provider(symbol)`. The fallback `threshold_usd` is used
     when the provider returns None or 0 (e.g. unknown symbol before the
     first turnover refresh).
+
+    v3.6.3: all arithmetic uses float (advisory-only system, no financial
+    precision requirement). Eliminates Decimal overhead in hot path.
     """
     def __init__(
         self,
-        threshold_usd: Decimal,
-        threshold_provider: Callable[[str], Decimal] | None = None,
+        threshold_usd: float,
+        threshold_provider: Callable[[str], float] | None = None,
     ):
         if threshold_usd <= 0:
             raise ValueError("threshold_usd must be > 0")
@@ -83,7 +85,7 @@ class DollarBarEngine(IBarAggregator):
         self._current_bars: dict[str, DollarBar] = {}
         self._on_bar_closed: Callable[[DollarBar], Awaitable[None]] | None = None
 
-    def _threshold_for(self, symbol: str) -> Decimal:
+    def _threshold_for(self, symbol: str) -> float:
         if self._threshold_provider is None:
             return self.threshold_usd
         try:
@@ -112,7 +114,7 @@ class DollarBarEngine(IBarAggregator):
             logger.warning(f"[CONFLATION] CAUSAL RESYNC: Уничтожено {purged_count} отравленных аккумуляторов.")
 
     async def process_tick(
-        self, symbol: str, price: Decimal, size: Decimal, is_buyer_maker: bool, exchange_ts: float
+        self, symbol: str, price: float, size: float, is_buyer_maker: bool, exchange_ts: float
     ) -> None:
         tick_usd = price * size
 
@@ -125,8 +127,10 @@ class DollarBarEngine(IBarAggregator):
             self._current_bars[symbol] = bar
 
         # Обновление экстремумов и цены закрытия
-        bar.high = max(bar.high, price)
-        bar.low = min(bar.low, price)
+        if price > bar.high:
+            bar.high = price
+        if price < bar.low:
+            bar.low = price
         bar.close = price
 
         # Обновление микроструктуры
