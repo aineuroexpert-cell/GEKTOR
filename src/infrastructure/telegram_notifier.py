@@ -248,12 +248,23 @@ class TelegramRadarNotifier:
     async def _send_text_with_retry(self, message: str) -> bool:
         """Sends one HTML message with retry semantics and 429 backoff."""
         body = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
-        timeout = aiohttp.ClientTimeout(total=5.0, connect=3.0)
+        
+        socks_proxy: bool = bool(
+            self.proxy_url
+            and self.proxy_url.lower().startswith(("socks4://", "socks5://", "socks5h://"))
+        )
+        http_proxy_kwarg: Optional[str] = (
+            self.proxy_url
+            if (self.proxy_url and not socks_proxy)
+            else None
+        )
 
-        for attempt in range(3):
+        timeout = aiohttp.ClientTimeout(total=10.0, connect=5.0)
+
+        for attempt in range(4):
             try:
                 if self._session and not self._session.closed:
-                    async with self._session.post(self.api_url, json=body, proxy=self.proxy_url) as resp:
+                    async with self._session.post(self.api_url, json=body, proxy=http_proxy_kwarg) as resp:
                         if resp.status == 429:
                             retry_after = int(resp.headers.get("Retry-After", 5))
                             self._last_retry_after_sec = retry_after
@@ -266,8 +277,14 @@ class TelegramRadarNotifier:
                             continue
                         return True
 
-                async with aiohttp.ClientSession(timeout=timeout) as temp_session:
-                    async with temp_session.post(self.api_url, json=body, proxy=self.proxy_url) as resp:
+                # Connector path: SOCKS proxies need a transport-level connector
+                if socks_proxy:
+                    connector = ProxyConnector.from_url(self.proxy_url)
+                else:
+                    connector = aiohttp.TCPConnector()
+
+                async with aiohttp.ClientSession(timeout=timeout, connector=connector) as temp_session:
+                    async with temp_session.post(self.api_url, json=body, proxy=http_proxy_kwarg) as resp:
                         if resp.status == 429:
                             retry_after = int(resp.headers.get("Retry-After", 5))
                             self._last_retry_after_sec = retry_after
