@@ -29,6 +29,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from src.application.radar_pipeline import RadarAlert
+from src.domain.liquidity_detectors import LiquidityAlert
 
 
 class OutboxAlertSink:
@@ -71,5 +72,48 @@ class OutboxAlertSink:
             "absorption": alert.absorption,
             "bar_close": alert.bar_close,
             "bar_open": alert.bar_open,
+            "timestamp": alert.timestamp,
+        }
+
+
+class OutboxLiquiditySink:
+    """Persist LiquidityAlert as a row in outbox_events with event_type=LIQUIDITY_ALERT.
+
+    Ensures microstructure events (Sweep, Large Print, OFI Pulse) are routed
+    with correct semantics, bypassing VPIN formatting templates.
+    """
+
+    def __init__(self, db_manager) -> None:
+        self._db = db_manager
+
+    async def __call__(self, alert: LiquidityAlert) -> None:
+        payload = json.dumps(self._format(alert))
+        now = datetime.now(timezone.utc)
+        async with self._db.SessionLocal() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO outbox_events "
+                    "(payload, status, created_at, execute_after, retry_count, priority) "
+                    "VALUES (:payload, 'PENDING', :now, :now, 0, 2)"
+                ),
+                {"payload": payload, "now": now},
+            )
+            await session.commit()
+        logger.debug(
+            f"[OutboxLiquiditySink] Persisted {alert.symbol} {alert.kind} {alert.direction} "
+            f"notional=${alert.notional_usd:,.0f}"
+        )
+
+    @staticmethod
+    def _format(alert: LiquidityAlert) -> dict:
+        return {
+            "event_type": "LIQUIDITY_ALERT",
+            "version": 1,
+            "symbol": alert.symbol,
+            "kind": alert.kind,
+            "direction": alert.direction,
+            "price": alert.price,
+            "notional_usd": alert.notional_usd,
+            "extra": alert.extra,
             "timestamp": alert.timestamp,
         }

@@ -65,6 +65,7 @@ class TelegramMessageFormatter:
             "ABORT":        self._fmt_abort,
             "RAW_TEXT":     self._fmt_raw_text,
             "RADAR_ALERT":  self._fmt_radar_alert,
+            "LIQUIDITY_ALERT": self._fmt_liquidity_alert,
         }
 
         handler = router.get(event_type)
@@ -254,4 +255,54 @@ class TelegramMessageFormatter:
             f"⏰ <code>{ts} UTC</code>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🧠 <b>СТАТУС: Среднесрочная аномалия, ручная верификация</b>"
+        )
+
+    def _fmt_liquidity_alert(self, payload: dict[str, Any]) -> str:
+        """Advisory-Mode LIQUIDITY_ALERT (v3.6.3 APEX-RADAR).
+
+        Formats Sweep, Large Print, and OFI Pulse events dynamically.
+        """
+        symbol = self._esc(payload.get("symbol", "UNKNOWN"))
+        kind = str(payload.get("kind", "UNKNOWN")).upper()
+        direction_raw = str(payload.get("direction", "")).upper()
+        direction = "🟢 BUY (Агрессивные покупки)" if direction_raw in {"LONG", "BUY"} else (
+            "🔴 SELL (Агрессивные продажи)" if direction_raw in {"SHORT", "SELL"} else "⚪ NEUTRAL"
+        )
+        price = self._safe_float(payload.get("price"))
+        notional = self._safe_float(payload.get("notional_usd"))
+        ts = self._ts_utc(payload)
+        extra = payload.get("extra", {})
+
+        # Dynamic details per kind
+        if kind == "SWEEP":
+            kind_title = "🌊 SWEEP (Снятие ликвидности)"
+            count = int(self._safe_float(extra.get("trade_count", 0)))
+            details = f"📊 <b>Сделок в каскаде:</b> <code>{count}</code>\n"
+            status = "🔥 <b>Каскад сноса стакана крупным игроком!</b>"
+        elif kind == "LARGE_PRINT":
+            kind_title = "🐳 LARGE PRINT (Блочная сделка)"
+            pct = self._safe_float(extra.get("pct_of_24h_turnover")) * 100.0
+            details = f"📊 <b>Объем:</b> <code>{pct:.3f}% от суточного оборота</code>\n"
+            status = "🎯 <b>Зафиксирован крупный разовый ордер (OTC/Block)!</b>"
+        elif kind == "OFI_PULSE":
+            kind_title = "⚡ OFI PULSE (Импульс дисбаланса)"
+            ratio = self._safe_float(extra.get("ratio_to_median"))
+            details = f"📊 <b>Сила импульса:</b> <code>{ratio:.1f}x от медианы</code>\n"
+            status = "🚀 <b>Резкое направленное давление лимитных ордеров!</b>"
+        else:
+            kind_title = f"🔍 {kind} ALERT"
+            details = ""
+            status = "Мониторинг микроструктуры"
+
+        return (
+            f"⚠️ <b>[GEKTOR MICROSTRUCTURE] {kind_title}</b> ⚠️\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Инструмент: <code>#{symbol}</code>\n"
+            f"🧭 Направление: {direction}\n"
+            f"💵 Цена актива: <code>${price:,.4f}</code>\n"
+            f"💰 USD Номинал: <code>${notional:,.0f}</code>\n"
+            f"{details}"
+            f"⏰ <code>{ts} UTC</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧠 <b>СТАТУС: {status}</b>"
         )

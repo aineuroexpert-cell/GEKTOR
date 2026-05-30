@@ -6,7 +6,7 @@ import sys
 from datetime import datetime, timezone
 from typing import NoReturn
 
-from src.application.outbox_alert_sink import OutboxAlertSink
+from src.application.outbox_alert_sink import OutboxAlertSink, OutboxLiquiditySink
 from src.application.radar_pipeline import RadarPipeline
 from src.application.watchdog import PartialBlindnessWatchdog
 from src.domain.liquidity_detectors import (
@@ -155,6 +155,7 @@ class GektorRadarCore:
             )
 
         self.alert_sink = OutboxAlertSink(self.db)
+        self.liquidity_sink = OutboxLiquiditySink(self.db)
         self.radar = RadarPipeline(
             threshold_usd=threshold_usd_env,
             alert_sink=self.alert_sink,
@@ -166,6 +167,7 @@ class GektorRadarCore:
                 self.threshold_provider.threshold_for if self.threshold_provider else None
             ),
             liquidity_detectors=self.liquidity_bank,
+            liquidity_alert_sink=self.liquidity_sink,
         )
         self._ws_tasks: list[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
