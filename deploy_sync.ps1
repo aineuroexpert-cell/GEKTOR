@@ -19,8 +19,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "📦 [2/3] Синхронизация сервера (Git Pull & Hard Reset)..." -ForegroundColor Yellow
-$DeployCmd = "cd $TargetDir && git fetch origin && git reset --hard origin/main && source venv/bin/activate && pip install -r requirements.txt && systemctl restart gektor.service"
-ssh $User@$TargetIP $DeployCmd
+$DeployCmd = "cd " + $TargetDir + " && git fetch origin && git reset --hard origin/main && source venv/bin/activate && pip install -r requirements.txt && systemctl restart gektor.service"
+ssh ($User + "@" + $TargetIP) $DeployCmd
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "❌ Ошибка деплоя на сервере!" -ForegroundColor Red
