@@ -342,6 +342,7 @@ class GektorRadarCore:
         except Exception as exc:
             logger.error(f"[SYSTEM] Telegram queue drain failed during shutdown: {exc!r}")
         await self.tg.stop()
+        await self.bybit_rest.close()
         await self.db.close()
 
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
@@ -378,6 +379,7 @@ class GektorRadarCore:
         except Exception as exc:
             logger.error(f"[SYSTEM] Telegram queue drain failed during hot_reload: {exc!r}")
         await self.tg.stop()
+        await self.bybit_rest.close()
         await self.db.close()
 
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
