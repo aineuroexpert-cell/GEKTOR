@@ -168,6 +168,18 @@ class GektorRadarCore:
             ),
             liquidity_detectors=self.liquidity_bank,
             liquidity_alert_sink=self.liquidity_sink,
+            # [GEKTOR v3.6.4] Noise Reduction Filters
+            macro_filter_enable=settings.MACRO_FILTER_ENABLE,
+            macro_btc_volatility_limit=settings.MACRO_BTC_VOLATILITY_LIMIT,
+            macro_eth_volatility_limit=settings.MACRO_ETH_VOLATILITY_LIMIT,
+            macro_window_size=settings.MACRO_WINDOW_SIZE,
+            cvd_filter_enable=settings.CVD_FILTER_ENABLE,
+            cvd_min_ratio=settings.CVD_MIN_RATIO,
+            adaptive_z_enable=settings.ADAPTIVE_Z_ENABLE,
+            adaptive_z_volatility_base=settings.ADAPTIVE_Z_VOLATILITY_BASE,
+            adaptive_z_sensitivity=settings.ADAPTIVE_Z_SENSITIVITY,
+            adaptive_z_min_mult=settings.ADAPTIVE_Z_MIN_MULT,
+            adaptive_z_max_mult=settings.ADAPTIVE_Z_MAX_MULT,
         )
         self._ws_tasks: list[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()

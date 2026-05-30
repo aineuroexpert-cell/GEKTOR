@@ -82,6 +82,16 @@ class O1VPINEngine:
         # Periodic rebuild counter (against IEEE-754 drift)
         "_bars_since_rebuild",
         "_rebuild_interval",
+        # v3.6.4 noise filters
+        "cvd_filter_enable",
+        "cvd_min_ratio",
+        "adaptive_z_enable",
+        "adaptive_z_volatility_base",
+        "adaptive_z_sensitivity",
+        "adaptive_z_min_mult",
+        "adaptive_z_max_mult",
+        "_net_imbalances",
+        "_running_net_imbalance_sum",
     )
 
     def __init__(
@@ -91,6 +101,14 @@ class O1VPINEngine:
         z_threshold: float = 2.5,
         z_history_size: int = 500,
         rebuild_interval: int = 10_000,
+        # v3.6.4 parameters
+        cvd_filter_enable: bool = False,
+        cvd_min_ratio: float = 0.15,
+        adaptive_z_enable: bool = False,
+        adaptive_z_volatility_base: float = 0.01,
+        adaptive_z_sensitivity: float = 0.5,
+        adaptive_z_min_mult: float = 0.8,
+        adaptive_z_max_mult: float = 2.0,
     ) -> None:
         if window_size < 2:
             raise ValueError("window_size must be >= 2")
@@ -103,8 +121,18 @@ class O1VPINEngine:
         self._anomaly_threshold_z = z_threshold
         self._rebuild_interval = rebuild_interval
 
+        # v3.6.4 noise filters
+        self.cvd_filter_enable = cvd_filter_enable
+        self.cvd_min_ratio = cvd_min_ratio
+        self.adaptive_z_enable = adaptive_z_enable
+        self.adaptive_z_volatility_base = adaptive_z_volatility_base
+        self.adaptive_z_sensitivity = adaptive_z_sensitivity
+        self.adaptive_z_min_mult = adaptive_z_min_mult
+        self.adaptive_z_max_mult = adaptive_z_max_mult
+
         # Pre-allocated buffers — never re-allocated after this point.
         self._imbalances = np.zeros(window_size, dtype=np.float64)
+        self._net_imbalances = np.zeros(window_size, dtype=np.float64)
         self._volumes = np.zeros(window_size, dtype=np.float64)
         self._price_history = np.zeros(window_size, dtype=np.float64)
         self._vpin_history = np.zeros(z_history_size, dtype=np.float64)
@@ -116,6 +144,7 @@ class O1VPINEngine:
         self._index = 0
         self._is_filled = False
         self._running_imbalance_sum = 0.0
+        self._running_net_imbalance_sum = 0.0
         self._running_volume_sum = 0.0
         self._z_index = 0
         self._z_count = 0
@@ -136,9 +165,11 @@ class O1VPINEngine:
         # O(N) but only fires on a time-gap event (rare, hours), not in the
         # hot path.
         self._imbalances *= decay
+        self._net_imbalances *= decay
         self._volumes *= decay
         self._vpin_history *= decay
         self._running_imbalance_sum = float(self._imbalances.sum())
+        self._running_net_imbalance_sum = float(self._net_imbalances.sum())
         self._running_volume_sum = float(self._volumes.sum())
         self._vpin_sum = float(self._vpin_history.sum())
         self._vpin_sq_sum = float((self._vpin_history**2).sum())
@@ -151,6 +182,7 @@ class O1VPINEngine:
         `_rebuild_interval` bars. This is invariant I-noDrift.
         """
         self._running_imbalance_sum = float(self._imbalances.sum())
+        self._running_net_imbalance_sum = float(self._net_imbalances.sum())
         self._running_volume_sum = float(self._volumes.sum())
         self._vpin_sum = float(self._vpin_history.sum())
         self._vpin_sq_sum = float((self._vpin_history**2).sum())
@@ -190,12 +222,15 @@ class O1VPINEngine:
         # --- VPIN window ring buffer (O(1)) ---
         current_idx = self._index
         old_abs_imbalance = self._imbalances[current_idx]
+        old_net_imbalance = self._net_imbalances[current_idx]
         old_volume = self._volumes[current_idx]
 
         self._running_imbalance_sum += (abs_imbalance - old_abs_imbalance)
+        self._running_net_imbalance_sum += (imbalance - old_net_imbalance)
         self._running_volume_sum += (bar.volume_usd - old_volume)
 
         self._imbalances[current_idx] = abs_imbalance
+        self._net_imbalances[current_idx] = imbalance
         self._volumes[current_idx] = bar.volume_usd
         self._price_history[current_idx] = price
 
@@ -244,7 +279,26 @@ class O1VPINEngine:
         std_dev = math.sqrt(variance)
 
         z_score = float((current_vpin - mean_vpin) / std_dev)
-        is_anomaly = bool(z_score > self._anomaly_threshold_z)
+
+        # --- Volatility-Adaptive Z-Score (P10) ---
+        target_z_threshold = self._anomaly_threshold_z
+        if self.adaptive_z_enable:
+            max_price = float(np.max(self._price_history))
+            min_price = float(np.min(self._price_history))
+            if min_price > 0.0:
+                volatility = (max_price - min_price) / min_price
+                volatility_ratio = volatility / self.adaptive_z_volatility_base
+                multiplier = 1.0 + self.adaptive_z_sensitivity * (volatility_ratio - 1.0)
+                multiplier = max(self.adaptive_z_min_mult, min(self.adaptive_z_max_mult, multiplier))
+                target_z_threshold = self._anomaly_threshold_z * multiplier
+
+        is_anomaly = bool(z_score > target_z_threshold)
+
+        # --- CVD Divergence Filter (P8) ---
+        if self.cvd_filter_enable:
+            net_ratio = abs(self._running_net_imbalance_sum) / total_volume
+            if net_ratio < self.cvd_min_ratio:
+                is_anomaly = False
 
         # --- Periodic O(N) rebuild against drift (invariant I-noDrift) ---
         self._bars_since_rebuild += 1

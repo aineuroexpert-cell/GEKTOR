@@ -135,6 +135,24 @@ class Settings(BaseSettings):
         default=50_000.0, alias="ofi_pulse_min_notional_usd"
     )
 
+    # [GEKTOR v3.6.4] Noise Reduction Filters
+    # 1. Market Macro-Context Filter (P9)
+    MACRO_FILTER_ENABLE: bool = Field(default=True, alias="macro_filter_enable")
+    MACRO_BTC_VOLATILITY_LIMIT: float = Field(default=0.01, alias="macro_btc_volatility_limit")
+    MACRO_ETH_VOLATILITY_LIMIT: float = Field(default=0.015, alias="macro_eth_volatility_limit")
+    MACRO_WINDOW_SIZE: int = Field(default=10, alias="macro_window_size")
+
+    # 2. CVD Divergence Detector (P8)
+    CVD_FILTER_ENABLE: bool = Field(default=True, alias="cvd_filter_enable")
+    CVD_MIN_RATIO: float = Field(default=0.15, alias="cvd_min_ratio")
+
+    # 3. Volatility-Adaptive Z-Score (P10)
+    ADAPTIVE_Z_ENABLE: bool = Field(default=True, alias="adaptive_z_enable")
+    ADAPTIVE_Z_VOLATILITY_BASE: float = Field(default=0.01, alias="adaptive_z_volatility_base")
+    ADAPTIVE_Z_SENSITIVITY: float = Field(default=0.5, alias="adaptive_z_sensitivity")
+    ADAPTIVE_Z_MIN_MULT: float = Field(default=0.8, alias="adaptive_z_min_mult")
+    ADAPTIVE_Z_MAX_MULT: float = Field(default=2.0, alias="adaptive_z_max_mult")
+
     # [GEKTOR v5.22] Adaptive Volume Clocks
     VOLUME_BUCKETS: dict[str, float] = alpha.VOLUME_CLOCKS if alpha.VOLUME_CLOCKS else {"DEFAULT": 1_000_000.0}
 

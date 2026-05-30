@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -103,6 +104,18 @@ class RadarPipeline:
         threshold_provider: ThresholdProvider | None = None,
         liquidity_detectors: LiquidityDetectorBank | None = None,
         liquidity_alert_sink: LiquidityAlertSink | None = None,
+        # v3.6.4 noise filters
+        macro_filter_enable: bool = False,
+        macro_btc_volatility_limit: float = 0.01,
+        macro_eth_volatility_limit: float = 0.015,
+        macro_window_size: int = 10,
+        cvd_filter_enable: bool = False,
+        cvd_min_ratio: float = 0.15,
+        adaptive_z_enable: bool = False,
+        adaptive_z_volatility_base: float = 0.01,
+        adaptive_z_sensitivity: float = 0.5,
+        adaptive_z_min_mult: float = 0.8,
+        adaptive_z_max_mult: float = 2.0,
     ) -> None:
         self.threshold_usd = threshold_usd
         self._alert_sink = alert_sink
@@ -110,6 +123,23 @@ class RadarPipeline:
         self._z_threshold = z_threshold
         self._z_history_size = z_history_size
         self._threshold_provider = threshold_provider
+
+        # v3.6.4 noise filters config
+        self._macro_filter_enable = macro_filter_enable
+        self._macro_btc_volatility_limit = macro_btc_volatility_limit
+        self._macro_eth_volatility_limit = macro_eth_volatility_limit
+        self._macro_window_size = macro_window_size
+        self._cvd_filter_enable = cvd_filter_enable
+        self._cvd_min_ratio = cvd_min_ratio
+        self._adaptive_z_enable = adaptive_z_enable
+        self._adaptive_z_volatility_base = adaptive_z_volatility_base
+        self._adaptive_z_sensitivity = adaptive_z_sensitivity
+        self._adaptive_z_min_mult = adaptive_z_min_mult
+        self._adaptive_z_max_mult = adaptive_z_max_mult
+
+        # Price rolling deques for macro context
+        self._btc_prices: deque[float] = deque(maxlen=macro_window_size)
+        self._eth_prices: deque[float] = deque(maxlen=macro_window_size)
 
         # Shared DollarBarEngine — its internal `_current_bars` dict already
         # partitions by symbol, so a single instance handles the whole universe.
@@ -234,6 +264,13 @@ class RadarPipeline:
 
     async def _on_bar_closed(self, bar: DollarBar) -> None:
         self._bar_count += 1
+
+        # Track macro index prices
+        if bar.symbol == "BTCUSDT":
+            self._btc_prices.append(bar.close)
+        elif bar.symbol == "ETHUSDT":
+            self._eth_prices.append(bar.close)
+
         engine = self._vpin_engines.get(bar.symbol)
         if engine is None:
             symbol_threshold = self._bar_engine._threshold_for(bar.symbol)
@@ -242,6 +279,13 @@ class RadarPipeline:
                 volume_threshold=symbol_threshold,
                 z_threshold=self._z_threshold,
                 z_history_size=self._z_history_size,
+                cvd_filter_enable=self._cvd_filter_enable,
+                cvd_min_ratio=self._cvd_min_ratio,
+                adaptive_z_enable=self._adaptive_z_enable,
+                adaptive_z_volatility_base=self._adaptive_z_volatility_base,
+                adaptive_z_sensitivity=self._adaptive_z_sensitivity,
+                adaptive_z_min_mult=self._adaptive_z_min_mult,
+                adaptive_z_max_mult=self._adaptive_z_max_mult,
             )
             self._vpin_engines[bar.symbol] = engine
             logger.info(
@@ -257,6 +301,16 @@ class RadarPipeline:
         if not signal.is_anomaly:
             return
 
+        # Market Macro-Context Filter (P9)
+        if bar.symbol not in ("BTCUSDT", "ETHUSDT") and self._is_macro_volatile():
+            btc_vol = self._get_btc_vol()
+            eth_vol = self._get_eth_vol()
+            logger.warning(
+                f"[RadarPipeline] Suppressed VPIN anomaly for {bar.symbol} due to high systemic volatility "
+                f"(BTC range={btc_vol:.2%}, ETH range={eth_vol:.2%})"
+            )
+            return
+
         if not self._rate_limiter.allow(bar.symbol):
             logger.debug(
                 f"[RadarPipeline] Suppressed alert for {bar.symbol} "
@@ -265,6 +319,42 @@ class RadarPipeline:
             return
 
         await self._dispatch_alert(bar, signal)
+
+    def _is_macro_volatile(self) -> bool:
+        if not self._macro_filter_enable:
+            return False
+
+        if len(self._btc_prices) >= 2:
+            btc_min = min(self._btc_prices)
+            btc_max = max(self._btc_prices)
+            if btc_min > 0.0:
+                btc_vol = (btc_max - btc_min) / btc_min
+                if btc_vol >= self._macro_btc_volatility_limit:
+                    return True
+
+        if len(self._eth_prices) >= 2:
+            eth_min = min(self._eth_prices)
+            eth_max = max(self._eth_prices)
+            if eth_min > 0.0:
+                eth_vol = (eth_max - eth_min) / eth_min
+                if eth_vol >= self._macro_eth_volatility_limit:
+                    return True
+
+        return False
+
+    def _get_btc_vol(self) -> float:
+        if len(self._btc_prices) >= 2:
+            btc_min = min(self._btc_prices)
+            if btc_min > 0.0:
+                return (max(self._btc_prices) - btc_min) / btc_min
+        return 0.0
+
+    def _get_eth_vol(self) -> float:
+        if len(self._eth_prices) >= 2:
+            eth_min = min(self._eth_prices)
+            if eth_min > 0.0:
+                return (max(self._eth_prices) - eth_min) / eth_min
+        return 0.0
 
     async def _dispatch_alert(self, bar: DollarBar, signal: VPINSignal) -> None:
         alert = RadarAlert(
